@@ -20,10 +20,10 @@
 #include <memory>
 #include <queue>
 
-#include "absl/strings/string_view.h"
+#include "test/core/call/yodel/yodel_test.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
-#include "test/core/call/yodel/yodel_test.h"
+#include "absl/strings/string_view.h"
 
 using testing::StrictMock;
 
@@ -78,8 +78,8 @@ class LoadBalancedCallDestinationTest : public YodelTest {
       handlers_.push(unstarted_call_handler.StartCall());
     }
 
-    absl::optional<CallHandler> PopHandler() {
-      if (handlers_.empty()) return absl::nullopt;
+    std::optional<CallHandler> PopHandler() {
+      if (handlers_.empty()) return std::nullopt;
       auto handler = std::move(handlers_.front());
       handlers_.pop();
       return handler;

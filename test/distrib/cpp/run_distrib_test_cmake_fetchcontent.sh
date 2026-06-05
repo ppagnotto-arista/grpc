@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+PS4='+ $(date "+[%H:%M:%S %Z]")\011 '
 set -ex
 
 cd "$(dirname "$0")/../../.."
@@ -33,6 +34,7 @@ pushd "examples/cpp/helloworld/cmake/build"
 # rather than cloning a release.
 cmake \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_STANDARD=17 \
   -DgRPC_BUILD_TESTS=OFF \
   -DgRPC_SSL_PROVIDER=package \
   -DGRPC_FETCHCONTENT=ON \

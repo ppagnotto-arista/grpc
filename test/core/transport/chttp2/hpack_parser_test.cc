@@ -25,28 +25,29 @@
 #include <grpc/support/alloc.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 
-#include "absl/cleanup/cleanup.h"
-#include "absl/random/random.h"
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
-#include "absl/types/optional.h"
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
 #include "src/core/lib/resource_quota/arena.h"
 #include "src/core/lib/resource_quota/memory_quota.h"
 #include "src/core/lib/resource_quota/resource_quota.h"
 #include "src/core/lib/slice/slice.h"
 #include "src/core/lib/transport/error_utils.h"
+#include "src/core/mitigation_engine/mitigation_engine.h"
 #include "src/core/util/ref_counted_ptr.h"
 #include "src/core/util/status_helper.h"
 #include "src/core/util/time.h"
 #include "test/core/test_util/parse_hexstring.h"
 #include "test/core/test_util/slice_splitter.h"
 #include "test/core/test_util/test_config.h"
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/cleanup/cleanup.h"
+#include "absl/random/random.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 
 namespace grpc_core {
 namespace {
@@ -64,8 +65,8 @@ struct TestInput {
 
 struct Test {
   std::string name;
-  absl::optional<size_t> table_size;
-  absl::optional<size_t> max_metadata_size;
+  std::optional<size_t> table_size;
+  std::optional<size_t> max_metadata_size;
   std::vector<TestInput> inputs;
 };
 
@@ -103,7 +104,7 @@ class ParseTest : public ::testing::TestWithParam<Test> {
   }
 
   void TestVector(grpc_slice_split_mode mode,
-                  absl::optional<size_t> max_metadata_size,
+                  std::optional<size_t> max_metadata_size,
                   std::string hexstring, absl::StatusOr<std::string> expect,
                   uint32_t flags) {
     ExecCtx exec_ctx;
@@ -123,7 +124,8 @@ class ParseTest : public ::testing::TestWithParam<Test> {
                                        : HPackParser::Boundary::None),
         flags & kWithPriority ? HPackParser::Priority::Included
                               : HPackParser::Priority::None,
-        HPackParser::LogInfo{1, HPackParser::LogInfo::kHeaders, false});
+        HPackParser::LogInfo{1, HPackParser::LogInfo::kHeaders, false},
+        nullptr);
 
     grpc_split_slices(mode, const_cast<grpc_slice*>(&input.c_slice()), 1,
                       &slices, &nslices);
@@ -824,6 +826,114 @@ INSTANTIATE_TEST_SUITE_P(
                    "Malicious varint encoding detected in HPACK stream"),
                kFailureIsConnectionError}}}),
     NameFromConfig);
+
+class MockMitigationEngine : public MitigationEngine {
+ public:
+  enum class Behavior { kNone, kRejectRpc, kCloseConnection };
+  explicit MockMitigationEngine(Behavior behavior) : behavior_(behavior) {}
+
+  std::optional<Action> EvaluateIncomingConnection(absl::string_view) override {
+    return std::nullopt;
+  }
+
+  std::optional<Action> EvaluateIncomingMetadata(absl::string_view key,
+                                                 absl::string_view) override {
+    if (behavior_ == Behavior::kRejectRpc && key == "custom-key") {
+      return Action::kRejectRpc;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<Action> EvaluateAllIncomingMetadata(
+      const grpc_metadata_batch&) override {
+    if (behavior_ == Behavior::kCloseConnection) {
+      return Action::kCloseConnection;
+    }
+    return std::nullopt;
+  }
+
+ private:
+  Behavior behavior_;
+};
+
+class MitigationEngineParseTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    grpc_init();
+    parser_ = std::make_unique<HPackParser>();
+  }
+  void TearDown() override {
+    ExecCtx exec_ctx;
+    parser_.reset();
+    grpc_shutdown();
+  }
+  std::unique_ptr<HPackParser> parser_;
+};
+
+TEST_F(MitigationEngineParseTest, RejectRpc) {
+  ExecCtx exec_ctx;
+  auto engine = MakeRefCounted<MockMitigationEngine>(
+      MockMitigationEngine::Behavior::kRejectRpc);
+  grpc_metadata_batch b;
+  parser_->BeginFrame(
+      &b, 4096, 4096, HPackParser::Boundary::None, HPackParser::Priority::None,
+      HPackParser::LogInfo{1, HPackParser::LogInfo::kHeaders, false},
+      engine.get());
+
+  auto input =
+      ParseHexstring("400a637573746f6d2d6b65790d637573746f6d2d686561646572");
+
+  absl::BitGen bitgen;
+  auto err =
+      parser_->Parse(input.c_slice(), true, absl::BitGenRef(bitgen), nullptr);
+
+  EXPECT_FALSE(err.ok());
+  intptr_t stream_id;
+  EXPECT_TRUE(
+      grpc_error_get_int(err, StatusIntProperty::kStreamId, &stream_id));
+
+  grpc_status_code code;
+  std::string message;
+  grpc_error_get_status(err, Timestamp::InfFuture(), &code, &message, nullptr,
+                        nullptr);
+  EXPECT_EQ(code, GRPC_STATUS_INTERNAL);
+  EXPECT_THAT(message, ::testing::HasSubstr(
+                           "Mitigation engine triggered action Reject RPC for "
+                           "key: custom-key"));
+}
+
+TEST_F(MitigationEngineParseTest, CloseConnection) {
+  ExecCtx exec_ctx;
+  auto engine = MakeRefCounted<MockMitigationEngine>(
+      MockMitigationEngine::Behavior::kCloseConnection);
+  grpc_metadata_batch b;
+  parser_->BeginFrame(
+      &b, 4096, 4096, HPackParser::Boundary::EndOfHeaders,
+      HPackParser::Priority::None,
+      HPackParser::LogInfo{1, HPackParser::LogInfo::kHeaders, false},
+      engine.get());
+
+  auto input =
+      ParseHexstring("400a637573746f6d2d6b65790d637573746f6d2d686561646572");
+
+  absl::BitGen bitgen;
+  auto err =
+      parser_->Parse(input.c_slice(), true, absl::BitGenRef(bitgen), nullptr);
+
+  EXPECT_FALSE(err.ok());
+  intptr_t stream_id;
+  EXPECT_FALSE(
+      grpc_error_get_int(err, StatusIntProperty::kStreamId, &stream_id));
+
+  grpc_status_code code;
+  std::string message;
+  grpc_error_get_status(err, Timestamp::InfFuture(), &code, &message, nullptr,
+                        nullptr);
+  EXPECT_EQ(code, GRPC_STATUS_INTERNAL);
+  EXPECT_THAT(message,
+              ::testing::HasSubstr(
+                  "Mitigation engine triggered action Close Connection"));
+}
 
 }  // namespace
 }  // namespace grpc_core

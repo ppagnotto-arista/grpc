@@ -21,9 +21,6 @@
 #include <grpc/slice.h>
 #include <grpc/status.h>
 
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
-#include "gtest/gtest.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/service_config/service_config.h"
@@ -32,6 +29,9 @@
 #include "src/core/util/ref_counted_ptr.h"
 #include "src/core/util/time.h"
 #include "test/core/test_util/test_config.h"
+#include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 
 namespace grpc_core {
 namespace testing {
@@ -57,7 +57,7 @@ TEST_F(RetryParserTest, ValidRetryThrottling) {
       "}";
   auto service_config = ServiceConfigImpl::Create(ChannelArgs(), test_json);
   ASSERT_TRUE(service_config.ok()) << service_config.status();
-  const auto* parsed_config = static_cast<internal::RetryGlobalConfig*>(
+  const auto* parsed_config = static_cast<RetryGlobalConfig*>(
       (*service_config)->GetGlobalParsedConfig(parser_index_));
   ASSERT_NE(parsed_config, nullptr);
   EXPECT_EQ(parsed_config->max_milli_tokens(), 2000);
@@ -135,14 +135,14 @@ TEST_F(RetryParserTest, ValidRetryPolicy) {
           ->GetMethodParsedConfigVector(
               grpc_slice_from_static_string("/TestServ/TestMethod"));
   ASSERT_NE(vector_ptr, nullptr);
-  const auto* parsed_config = static_cast<internal::RetryMethodConfig*>(
-      ((*vector_ptr)[parser_index_]).get());
+  const auto* parsed_config =
+      static_cast<RetryMethodConfig*>(((*vector_ptr)[parser_index_]).get());
   ASSERT_NE(parsed_config, nullptr);
   EXPECT_EQ(parsed_config->max_attempts(), 3);
   EXPECT_EQ(parsed_config->initial_backoff(), Duration::Seconds(1));
   EXPECT_EQ(parsed_config->max_backoff(), Duration::Minutes(2));
   EXPECT_EQ(parsed_config->backoff_multiplier(), 1.6f);
-  EXPECT_EQ(parsed_config->per_attempt_recv_timeout(), absl::nullopt);
+  EXPECT_EQ(parsed_config->per_attempt_recv_timeout(), std::nullopt);
   EXPECT_TRUE(
       parsed_config->retryable_status_codes().Contains(GRPC_STATUS_ABORTED));
 }
@@ -527,8 +527,8 @@ TEST_F(RetryParserTest, ValidRetryPolicyWithPerAttemptRecvTimeout) {
           ->GetMethodParsedConfigVector(
               grpc_slice_from_static_string("/TestServ/TestMethod"));
   ASSERT_NE(vector_ptr, nullptr);
-  const auto* parsed_config = static_cast<internal::RetryMethodConfig*>(
-      ((*vector_ptr)[parser_index_]).get());
+  const auto* parsed_config =
+      static_cast<RetryMethodConfig*>(((*vector_ptr)[parser_index_]).get());
   ASSERT_NE(parsed_config, nullptr);
   EXPECT_EQ(parsed_config->max_attempts(), 2);
   EXPECT_EQ(parsed_config->initial_backoff(), Duration::Seconds(1));
@@ -564,14 +564,14 @@ TEST_F(RetryParserTest,
           ->GetMethodParsedConfigVector(
               grpc_slice_from_static_string("/TestServ/TestMethod"));
   ASSERT_NE(vector_ptr, nullptr);
-  const auto* parsed_config = static_cast<internal::RetryMethodConfig*>(
-      ((*vector_ptr)[parser_index_]).get());
+  const auto* parsed_config =
+      static_cast<RetryMethodConfig*>(((*vector_ptr)[parser_index_]).get());
   ASSERT_NE(parsed_config, nullptr);
   EXPECT_EQ(parsed_config->max_attempts(), 2);
   EXPECT_EQ(parsed_config->initial_backoff(), Duration::Seconds(1));
   EXPECT_EQ(parsed_config->max_backoff(), Duration::Minutes(2));
   EXPECT_EQ(parsed_config->backoff_multiplier(), 1.6f);
-  EXPECT_EQ(parsed_config->per_attempt_recv_timeout(), absl::nullopt);
+  EXPECT_EQ(parsed_config->per_attempt_recv_timeout(), std::nullopt);
   EXPECT_TRUE(
       parsed_config->retryable_status_codes().Contains(GRPC_STATUS_ABORTED));
 }
@@ -602,8 +602,8 @@ TEST_F(RetryParserTest,
           ->GetMethodParsedConfigVector(
               grpc_slice_from_static_string("/TestServ/TestMethod"));
   ASSERT_NE(vector_ptr, nullptr);
-  const auto* parsed_config = static_cast<internal::RetryMethodConfig*>(
-      ((*vector_ptr)[parser_index_]).get());
+  const auto* parsed_config =
+      static_cast<RetryMethodConfig*>(((*vector_ptr)[parser_index_]).get());
   ASSERT_NE(parsed_config, nullptr);
   EXPECT_EQ(parsed_config->max_attempts(), 2);
   EXPECT_EQ(parsed_config->initial_backoff(), Duration::Seconds(1));

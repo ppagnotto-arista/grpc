@@ -23,10 +23,10 @@
 #include <string>
 #include <utility>
 
+#include "src/core/util/no_destruct.h"
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/strings/str_format.h"
-#include "src/core/util/no_destruct.h"
 
 // IWYU pragma: no_include <ratio>
 
@@ -84,7 +84,7 @@ GPR_ATTRIBUTE_NOINLINE std::pair<int64_t, gpr_cycle_counter> InitTime() {
     g_process_epoch_cycles.store(process_epoch_cycles,
                                  std::memory_order_relaxed);
   }
-  return std::make_pair(process_epoch_seconds, process_epoch_cycles);
+  return std::pair(process_epoch_seconds, process_epoch_cycles);
 }
 
 gpr_timespec StartTime() {

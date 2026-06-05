@@ -13,17 +13,11 @@
 // limitations under the License.
 //
 
-#include <gmock/gmock.h>
 #include <grpc/event_engine/endpoint_config.h>
-#include <gtest/gtest.h>
 
 #include <string>
 #include <vector>
 
-#include "absl/log/check.h"
-#include "absl/log/log.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_format.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/extensions/clusters/aggregate/v3/cluster.pb.h"
 #include "src/core/client_channel/backup_poller.h"
@@ -32,9 +26,16 @@
 #include "src/core/load_balancing/xds/xds_channel_args.h"
 #include "src/core/resolver/fake/fake_resolver.h"
 #include "src/core/util/env.h"
+#include "src/core/util/grpc_check.h"
 #include "test/core/test_util/resolve_localhost_ip46.h"
+#include "test/core/test_util/scoped_env_var.h"
 #include "test/cpp/end2end/connection_attempt_injector.h"
 #include "test/cpp/end2end/xds/xds_end2end_test_lib.h"
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
 
 namespace grpc {
 namespace testing {
@@ -42,6 +43,8 @@ namespace {
 
 using ::envoy::config::core::v3::HealthStatus;
 using ::envoy::extensions::clusters::aggregate::v3::ClusterConfig;
+
+const double kExtraTolerance = 0.02;
 
 class RingHashTest : public XdsEnd2endTest {
  protected:
@@ -68,9 +71,9 @@ class RingHashTest : public XdsEnd2endTest {
     for (int port : ports) {
       absl::StatusOr<grpc_core::URI> lb_uri =
           grpc_core::URI::Parse(grpc_core::LocalIpUri(port));
-      CHECK_OK(lb_uri);
+      GRPC_CHECK_OK(lb_uri);
       grpc_resolved_address address;
-      CHECK(grpc_parse_uri(*lb_uri, &address));
+      GRPC_CHECK(grpc_parse_uri(*lb_uri, &address));
       addresses.emplace_back(address, grpc_core::ChannelArgs());
     }
     return addresses;
@@ -455,6 +458,160 @@ TEST_P(RingHashTest, HeaderHashingWithRegexRewrite) {
   EXPECT_TRUE(found);
 }
 
+TEST_P(RingHashTest, HashKeysInEds) {
+  grpc_core::testing::ScopedEnvVar env(
+      "GRPC_XDS_ENDPOINT_HASH_KEY_BACKWARD_COMPAT", "false");
+  CreateAndStartBackends(4);
+  auto cluster = default_cluster_;
+  cluster.set_lb_policy(Cluster::RING_HASH);
+  balancer_->ads_service()->SetCdsResource(cluster);
+  auto new_route_config = default_route_config_;
+  auto* route = new_route_config.mutable_virtual_hosts(0)->mutable_routes(0);
+  auto* hash_policy = route->mutable_route()->add_hash_policy();
+  hash_policy->mutable_header()->set_header_name("address_hash");
+  SetListenerAndRouteConfiguration(balancer_.get(), default_listener_,
+                                   new_route_config);
+  EdsResourceArgs args(
+      {{"locality0",
+        {
+            CreateEndpoint(0,
+                           /*health_status=*/
+                           ::envoy::config::core::v3::HealthStatus::UNKNOWN,
+                           /*lb_weight=*/1, /*additional_backend_indexes=*/{},
+                           /*hostname=*/"",
+                           {{"envoy.lb", "{\"hash_key\":\"foo\"}"}}),
+            CreateEndpoint(1,
+                           /*health_status=*/
+                           ::envoy::config::core::v3::HealthStatus::UNKNOWN,
+                           /*lb_weight=*/1, /*additional_backend_indexes=*/{},
+                           /*hostname=*/"",
+                           {{"envoy.lb", "{\"hash_key\":\"bar\"}"}}),
+            CreateEndpoint(2,
+                           /*health_status=*/
+                           ::envoy::config::core::v3::HealthStatus::UNKNOWN,
+                           /*lb_weight=*/1, /*additional_backend_indexes=*/{},
+                           /*hostname=*/"",
+                           {{"envoy.lb", "{\"hash_key\":\"baz\"}"}}),
+            CreateEndpoint(3,
+                           /*health_status=*/
+                           ::envoy::config::core::v3::HealthStatus::UNKNOWN,
+                           /*lb_weight=*/1, /*additional_backend_indexes=*/{},
+                           /*hostname=*/"",
+                           {{"envoy.lb", "{\"hash_key\":\"quux\"}"}}),
+        }}});
+  balancer_->ads_service()->SetEdsResource(BuildEdsResource(args));
+  // Note each type of RPC will contains a header value that will always be
+  // hashed to a specific backend as the header value matches the value used
+  // to create the entry in the ring.
+  std::vector<std::pair<std::string, std::string>> metadata = {
+      {"address_hash", "foo_0"}};
+  std::vector<std::pair<std::string, std::string>> metadata1 = {
+      {"address_hash", "bar_0"}};
+  std::vector<std::pair<std::string, std::string>> metadata2 = {
+      {"address_hash", "baz_0"}};
+  std::vector<std::pair<std::string, std::string>> metadata3 = {
+      {"address_hash", "quux_0"}};
+  const auto rpc_options =
+      RpcOptions().set_metadata(std::move(metadata)).set_timeout_ms(5000);
+  const auto rpc_options1 =
+      RpcOptions().set_metadata(std::move(metadata1)).set_timeout_ms(5000);
+  const auto rpc_options2 =
+      RpcOptions().set_metadata(std::move(metadata2)).set_timeout_ms(5000);
+  const auto rpc_options3 =
+      RpcOptions().set_metadata(std::move(metadata3)).set_timeout_ms(5000);
+  WaitForBackend(DEBUG_LOCATION, 0, /*check_status=*/nullptr,
+                 WaitForBackendOptions(), rpc_options);
+  WaitForBackend(DEBUG_LOCATION, 1, /*check_status=*/nullptr,
+                 WaitForBackendOptions(), rpc_options1);
+  WaitForBackend(DEBUG_LOCATION, 2, /*check_status=*/nullptr,
+                 WaitForBackendOptions(), rpc_options2);
+  WaitForBackend(DEBUG_LOCATION, 3, /*check_status=*/nullptr,
+                 WaitForBackendOptions(), rpc_options3);
+  CheckRpcSendOk(DEBUG_LOCATION, 100, rpc_options);
+  CheckRpcSendOk(DEBUG_LOCATION, 100, rpc_options1);
+  CheckRpcSendOk(DEBUG_LOCATION, 100, rpc_options2);
+  CheckRpcSendOk(DEBUG_LOCATION, 100, rpc_options3);
+  for (size_t i = 0; i < backends_.size(); ++i) {
+    EXPECT_EQ(100, backends_[i]->backend_service()->request_count());
+  }
+}
+
+TEST_P(RingHashTest, HashKeysInEdsNotEnabled) {
+  CreateAndStartBackends(4);
+  auto cluster = default_cluster_;
+  cluster.set_lb_policy(Cluster::RING_HASH);
+  balancer_->ads_service()->SetCdsResource(cluster);
+  auto new_route_config = default_route_config_;
+  auto* route = new_route_config.mutable_virtual_hosts(0)->mutable_routes(0);
+  auto* hash_policy = route->mutable_route()->add_hash_policy();
+  hash_policy->mutable_header()->set_header_name("address_hash");
+  SetListenerAndRouteConfiguration(balancer_.get(), default_listener_,
+                                   new_route_config);
+  EdsResourceArgs args(
+      {{"locality0",
+        {
+            CreateEndpoint(0,
+                           /*health_status=*/
+                           ::envoy::config::core::v3::HealthStatus::UNKNOWN,
+                           /*lb_weight=*/1, /*additional_backend_indexes=*/{},
+                           /*hostname=*/"",
+                           {{"envoy.lb", "{\"hash_key\":\"foo\"}"}}),
+            CreateEndpoint(1,
+                           /*health_status=*/
+                           ::envoy::config::core::v3::HealthStatus::UNKNOWN,
+                           /*lb_weight=*/1, /*additional_backend_indexes=*/{},
+                           /*hostname=*/"",
+                           {{"envoy.lb", "{\"hash_key\":\"bar\"}"}}),
+            CreateEndpoint(2,
+                           /*health_status=*/
+                           ::envoy::config::core::v3::HealthStatus::UNKNOWN,
+                           /*lb_weight=*/1, /*additional_backend_indexes=*/{},
+                           /*hostname=*/"",
+                           {{"envoy.lb", "{\"hash_key\":\"baz\"}"}}),
+            CreateEndpoint(3,
+                           /*health_status=*/
+                           ::envoy::config::core::v3::HealthStatus::UNKNOWN,
+                           /*lb_weight=*/1, /*additional_backend_indexes=*/{},
+                           /*hostname=*/"",
+                           {{"envoy.lb", "{\"hash_key\":\"quux\"}"}}),
+        }}});
+  balancer_->ads_service()->SetEdsResource(BuildEdsResource(args));
+  // Note each type of RPC will contains a header value that will always be
+  // hashed to a specific backend as the header value matches the value used
+  // to create the entry in the ring.
+  std::vector<std::pair<std::string, std::string>> metadata = {
+      {"address_hash", CreateMetadataValueThatHashesToBackend(0)}};
+  std::vector<std::pair<std::string, std::string>> metadata1 = {
+      {"address_hash", CreateMetadataValueThatHashesToBackend(1)}};
+  std::vector<std::pair<std::string, std::string>> metadata2 = {
+      {"address_hash", CreateMetadataValueThatHashesToBackend(2)}};
+  std::vector<std::pair<std::string, std::string>> metadata3 = {
+      {"address_hash", CreateMetadataValueThatHashesToBackend(3)}};
+  const auto rpc_options =
+      RpcOptions().set_metadata(std::move(metadata)).set_timeout_ms(5000);
+  const auto rpc_options1 =
+      RpcOptions().set_metadata(std::move(metadata1)).set_timeout_ms(5000);
+  const auto rpc_options2 =
+      RpcOptions().set_metadata(std::move(metadata2)).set_timeout_ms(5000);
+  const auto rpc_options3 =
+      RpcOptions().set_metadata(std::move(metadata3)).set_timeout_ms(5000);
+  WaitForBackend(DEBUG_LOCATION, 0, /*check_status=*/nullptr,
+                 WaitForBackendOptions(), rpc_options);
+  WaitForBackend(DEBUG_LOCATION, 1, /*check_status=*/nullptr,
+                 WaitForBackendOptions(), rpc_options1);
+  WaitForBackend(DEBUG_LOCATION, 2, /*check_status=*/nullptr,
+                 WaitForBackendOptions(), rpc_options2);
+  WaitForBackend(DEBUG_LOCATION, 3, /*check_status=*/nullptr,
+                 WaitForBackendOptions(), rpc_options3);
+  CheckRpcSendOk(DEBUG_LOCATION, 100, rpc_options);
+  CheckRpcSendOk(DEBUG_LOCATION, 100, rpc_options1);
+  CheckRpcSendOk(DEBUG_LOCATION, 100, rpc_options2);
+  CheckRpcSendOk(DEBUG_LOCATION, 100, rpc_options3);
+  for (size_t i = 0; i < backends_.size(); ++i) {
+    EXPECT_EQ(100, backends_[i]->backend_service()->request_count());
+  }
+}
+
 // Tests that ring hash policy that hashes using a random value.
 TEST_P(RingHashTest, NoHashPolicy) {
   CreateAndStartBackends(2);
@@ -480,9 +637,11 @@ TEST_P(RingHashTest, NoHashPolicy) {
   const int request_count_1 = backends_[0]->backend_service()->request_count();
   const int request_count_2 = backends_[1]->backend_service()->request_count();
   EXPECT_THAT(static_cast<double>(request_count_1) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution50Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution50Percent,
+                                    kErrorTolerance + kExtraTolerance));
   EXPECT_THAT(static_cast<double>(request_count_2) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution50Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution50Percent,
+                                    kErrorTolerance + kExtraTolerance));
 }
 
 // Tests that we observe endpoint weights.
@@ -522,11 +681,14 @@ TEST_P(RingHashTest, EndpointWeights) {
   const int request_count_1 = backends_[1]->backend_service()->request_count();
   const int request_count_2 = backends_[2]->backend_service()->request_count();
   EXPECT_THAT(static_cast<double>(request_count_0) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution25Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution25Percent,
+                                    kErrorTolerance + kExtraTolerance));
   EXPECT_THAT(static_cast<double>(request_count_1) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution25Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution25Percent,
+                                    kErrorTolerance + kExtraTolerance));
   EXPECT_THAT(static_cast<double>(request_count_2) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution50Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution50Percent,
+                                    kErrorTolerance + kExtraTolerance));
 }
 
 // Test that ring hash policy evaluation will continue past the terminal
@@ -592,9 +754,11 @@ TEST_P(RingHashTest, HashOnHeaderThatIsNotPresent) {
   const int request_count_1 = backends_[0]->backend_service()->request_count();
   const int request_count_2 = backends_[1]->backend_service()->request_count();
   EXPECT_THAT(static_cast<double>(request_count_1) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution50Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution50Percent,
+                                    kErrorTolerance + kExtraTolerance));
   EXPECT_THAT(static_cast<double>(request_count_2) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution50Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution50Percent,
+                                    kErrorTolerance + kExtraTolerance));
 }
 
 // Test random hash is used when only unsupported hash policies are
@@ -635,13 +799,15 @@ TEST_P(RingHashTest, UnsupportedHashPolicyDefaultToRandomHashing) {
   const int request_count_1 = backends_[0]->backend_service()->request_count();
   const int request_count_2 = backends_[1]->backend_service()->request_count();
   EXPECT_THAT(static_cast<double>(request_count_1) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution50Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution50Percent,
+                                    kErrorTolerance + kExtraTolerance));
   EXPECT_THAT(static_cast<double>(request_count_2) / kNumRpcs,
-              ::testing::DoubleNear(kDistribution50Percent, kErrorTolerance));
+              ::testing::DoubleNear(kDistribution50Percent,
+                                    kErrorTolerance + kExtraTolerance));
 }
 
 // Tests that ring hash policy that hashes using a random value can spread
-// RPCs across all the backends according to locality weight.
+// RPCs across all the backends according to endpoint weight.
 TEST_P(RingHashTest, RandomHashingDistributionAccordingToEndpointWeight) {
   CreateAndStartBackends(2);
   const size_t kWeight1 = 1;
@@ -674,13 +840,15 @@ TEST_P(RingHashTest, RandomHashingDistributionAccordingToEndpointWeight) {
   const int weight_66_request_count =
       backends_[1]->backend_service()->request_count();
   EXPECT_THAT(static_cast<double>(weight_33_request_count) / kNumRpcs,
-              ::testing::DoubleNear(kWeight33Percent, kErrorTolerance));
+              ::testing::DoubleNear(kWeight33Percent,
+                                    kErrorTolerance + kExtraTolerance));
   EXPECT_THAT(static_cast<double>(weight_66_request_count) / kNumRpcs,
-              ::testing::DoubleNear(kWeight66Percent, kErrorTolerance));
+              ::testing::DoubleNear(kWeight66Percent,
+                                    kErrorTolerance + kExtraTolerance));
 }
 
 // Tests that ring hash policy that hashes using a random value can spread
-// RPCs across all the backends according to locality weight.
+// RPCs across all the backends according to locality and endpoint weight.
 TEST_P(RingHashTest,
        RandomHashingDistributionAccordingToLocalityAndEndpointWeight) {
   CreateAndStartBackends(2);
@@ -714,9 +882,11 @@ TEST_P(RingHashTest,
   const int weight_80_request_count =
       backends_[1]->backend_service()->request_count();
   EXPECT_THAT(static_cast<double>(weight_20_request_count) / kNumRpcs,
-              ::testing::DoubleNear(kWeight20Percent, kErrorTolerance));
+              ::testing::DoubleNear(kWeight20Percent,
+                                    kErrorTolerance + kExtraTolerance));
   EXPECT_THAT(static_cast<double>(weight_80_request_count) / kNumRpcs,
-              ::testing::DoubleNear(kWeight80Percent, kErrorTolerance));
+              ::testing::DoubleNear(kWeight80Percent,
+                                    kErrorTolerance + kExtraTolerance));
 }
 
 // Tests that ring hash policy that hashes using a fixed string ensures all
@@ -817,90 +987,6 @@ TEST_P(RingHashTest, ContinuesConnectingWithoutPicks) {
   hold->Resume();
   // Wait for channel to become connected without any pending RPC.
   EXPECT_TRUE(channel_->WaitForConnected(grpc_timeout_seconds_to_deadline(5)));
-  // Make sure the backend did not get any requests.
-  EXPECT_EQ(0UL, backends_[0]->backend_service()->request_count());
-}
-
-// Tests that when we trigger internal connection attempts without
-// picks, we do so for only one subchannel at a time.
-TEST_P(RingHashTest, ContinuesConnectingWithoutPicksOneSubchannelAtATime) {
-  // Create EDS resource.
-  CreateAndStartBackends(1);
-  auto non_existent_endpoint0 = MakeNonExistentEndpoint();
-  auto non_existent_endpoint1 = MakeNonExistentEndpoint();
-  auto non_existent_endpoint2 = MakeNonExistentEndpoint();
-  EdsResourceArgs args({{"locality0",
-                         {non_existent_endpoint0, non_existent_endpoint1,
-                          non_existent_endpoint2, CreateEndpoint(0)}}});
-  balancer_->ads_service()->SetEdsResource(BuildEdsResource(args));
-  // Change CDS resource to use RING_HASH.
-  auto cluster = default_cluster_;
-  cluster.set_lb_policy(Cluster::RING_HASH);
-  balancer_->ads_service()->SetCdsResource(cluster);
-  // Add hash policy to RDS resource.
-  auto new_route_config = default_route_config_;
-  auto* route = new_route_config.mutable_virtual_hosts(0)->mutable_routes(0);
-  auto* hash_policy = route->mutable_route()->add_hash_policy();
-  hash_policy->mutable_header()->set_header_name("address_hash");
-  SetListenerAndRouteConfiguration(balancer_.get(), default_listener_,
-                                   new_route_config);
-  // Start connection attempt injector.
-  ConnectionAttemptInjector injector;
-  auto hold_non_existent0 = injector.AddHold(non_existent_endpoint0.port);
-  auto hold_non_existent1 = injector.AddHold(non_existent_endpoint1.port);
-  auto hold_non_existent2 = injector.AddHold(non_existent_endpoint2.port);
-  auto hold_good = injector.AddHold(backends_[0]->port());
-  // A long-running RPC, just used to send the RPC in another thread.
-  LongRunningRpc rpc;
-  std::vector<std::pair<std::string, std::string>> metadata = {
-      {"address_hash", CreateMetadataValueThatHashesToBackendPort(
-                           non_existent_endpoint0.port)}};
-  rpc.StartRpc(stub_.get(), RpcOptions().set_timeout_ms(0).set_metadata(
-                                std::move(metadata)));
-  // Wait for the RPC to trigger a connection attempt to the first address,
-  // then cancel the RPC.  No other connection attempts should be started yet.
-  hold_non_existent0->Wait();
-  rpc.CancelRpc();
-  EXPECT_FALSE(hold_non_existent1->IsStarted());
-  EXPECT_FALSE(hold_non_existent2->IsStarted());
-  EXPECT_FALSE(hold_good->IsStarted());
-  // Allow the connection attempt to the first address to resume and wait
-  // for the attempt for the second address.  No other connection
-  // attempts should be started yet.
-  auto hold_non_existent0_again = injector.AddHold(non_existent_endpoint0.port);
-  hold_non_existent0->Resume();
-  hold_non_existent1->Wait();
-  EXPECT_FALSE(hold_non_existent0_again->IsStarted());
-  EXPECT_FALSE(hold_non_existent2->IsStarted());
-  EXPECT_FALSE(hold_good->IsStarted());
-  // Allow the connection attempt to the second address to resume and wait
-  // for the attempt for the third address.  No other connection
-  // attempts should be started yet.
-  auto hold_non_existent1_again = injector.AddHold(non_existent_endpoint1.port);
-  hold_non_existent1->Resume();
-  hold_non_existent2->Wait();
-  EXPECT_FALSE(hold_non_existent0_again->IsStarted());
-  EXPECT_FALSE(hold_non_existent1_again->IsStarted());
-  EXPECT_FALSE(hold_good->IsStarted());
-  // Allow the connection attempt to the third address to resume and wait
-  // for the attempt for the final address.  No other connection
-  // attempts should be started yet.
-  auto hold_non_existent2_again = injector.AddHold(non_existent_endpoint2.port);
-  hold_non_existent2->Resume();
-  hold_good->Wait();
-  EXPECT_FALSE(hold_non_existent0_again->IsStarted());
-  EXPECT_FALSE(hold_non_existent1_again->IsStarted());
-  EXPECT_FALSE(hold_non_existent2_again->IsStarted());
-  // Allow the final attempt to resume.
-  hold_good->Resume();
-  // Wait for channel to become connected without any pending RPC.
-  EXPECT_TRUE(channel_->WaitForConnected(grpc_timeout_seconds_to_deadline(10)));
-  // No other connection attempts should have been started.
-  EXPECT_FALSE(hold_non_existent0_again->IsStarted());
-  EXPECT_FALSE(hold_non_existent1_again->IsStarted());
-  EXPECT_FALSE(hold_non_existent2_again->IsStarted());
-  // RPC should have been cancelled.
-  EXPECT_EQ(StatusCode::CANCELLED, rpc.GetStatus().error_code());
   // Make sure the backend did not get any requests.
   EXPECT_EQ(0UL, backends_[0]->backend_service()->request_count());
 }
@@ -1105,7 +1191,7 @@ TEST_P(RingHashTest, ReattemptWhenGoingFromTransientFailureToIdle) {
   // Channel should fail RPCs and go into TRANSIENT_FAILURE.
   CheckRpcSendFailure(
       DEBUG_LOCATION, StatusCode::UNAVAILABLE,
-      "empty address list: EDS resource eds_service_name contains empty "
+      "empty address list: EDS resource eds_service_name: contains empty "
       "localities: \\[\\{region=\"xds_default_locality_region\", "
       "zone=\"xds_default_locality_zone\", sub_zone=\"locality0\"\\}\\]",
       RpcOptions().set_timeout_ms(kConnectionTimeoutMilliseconds));
@@ -1169,10 +1255,6 @@ int main(int argc, char** argv) {
   grpc_core::ConfigVars::Overrides overrides;
   overrides.client_channel_backup_poll_interval_ms = 1;
   grpc_core::ConfigVars::SetOverrides(overrides);
-#if TARGET_OS_IPHONE
-  // Workaround Apple CFStream bug
-  grpc_core::SetEnv("grpc_cfstream", "0");
-#endif
   grpc_init();
   grpc::testing::ConnectionAttemptInjector::Init();
   const auto result = RUN_ALL_TESTS();

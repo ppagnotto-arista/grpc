@@ -25,7 +25,7 @@
       ],
     
       dependencies: [
-        .package(url: "https://github.com/firebase/abseil-cpp-SwiftPM.git", "0.20240722.0"..<"0.20240723.0"),
+        .package(url: "https://github.com/firebase/abseil-cpp-SwiftPM.git", "0.20250512.1"..<"0.20250512.2"),
         .package(url: "https://github.com/firebase/boringssl-SwiftPM.git", "0.32.0"..<"0.33.0"),
       ],
     
@@ -84,7 +84,6 @@
           path: basePath,
           exclude: [
             "examples/",
-            "src/cpp/client/cronet_credentials.cc",
             "src/cpp/client/channel_test_peer.cc",
             "src/cpp/common/alts_util.cc",
             "src/cpp/common/alts_context.cc",
@@ -124,5 +123,5 @@
         ),
       ],
       cLanguageStandard: .gnu11,
-      cxxLanguageStandard: .cxx14
+      cxxLanguageStandard: .cxx17
     )

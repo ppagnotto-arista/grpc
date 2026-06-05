@@ -17,7 +17,6 @@
 #include <grpcpp/client_context.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/support/server_callback.h>
-#include <gtest/gtest.h>
 
 #include <memory>
 #include <string>
@@ -25,18 +24,19 @@
 #include <utility>
 #include <vector>
 
-#include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
-#include "absl/time/time.h"
+#include "src/core/credentials/transport/fake/fake_credentials.h"
 #include "src/core/lib/event_engine/tcp_socket_utils.h"
 #include "src/core/lib/experiments/config.h"
-#include "src/core/lib/security/credentials/fake/fake_credentials.h"
 #include "src/core/util/notification.h"
 #include "src/cpp/server/secure_server_credentials.h"
 #include "src/proto/grpc/testing/echo.grpc.pb.h"
 #include "test/core/test_util/port.h"
 #include "test/core/test_util/test_config.h"
 #include "test/cpp/util/credentials.h"
+#include "gtest/gtest.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/time/time.h"
 
 // IWYU pragma: no_include <sys/socket.h>
 

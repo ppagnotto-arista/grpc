@@ -29,14 +29,14 @@
 
 #include <memory>
 
-#include "absl/log/log.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_split.h"
 #include "src/proto/grpc/testing/empty.pb.h"
 #include "src/proto/grpc/testing/messages.pb.h"
 #include "src/proto/grpc/testing/test.grpc.pb.h"
 #include "test/cpp/end2end/test_health_check_service_impl.h"
 #include "test/cpp/interop/pre_stop_hook_server.h"
+#include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 
 namespace grpc {
 namespace testing {
@@ -187,7 +187,7 @@ class MaintenanceServices {
 };
 }  // namespace
 
-absl::optional<grpc::Status> GetStatusForRpcBehaviorMetadata(
+std::optional<grpc::Status> GetStatusForRpcBehaviorMetadata(
     absl::string_view header_value, absl::string_view hostname) {
   for (auto part : absl::StrSplit(header_value, ' ')) {
     if (absl::ConsumePrefix(&part, kHostnameRpcBehaviorFilter)) {
@@ -201,7 +201,7 @@ absl::optional<grpc::Status> GetStatusForRpcBehaviorMetadata(
       if (part != hostname) {
         VLOG(2) << "RPC behavior for a different host: \"" << std::string(part)
                 << "\", this one is: \"" << hostname << "\"";
-        return absl::nullopt;
+        return std::nullopt;
       }
     } else if (absl::ConsumePrefix(&part, kErrorCodeRpcBehavior)) {
       grpc::StatusCode code;
@@ -222,7 +222,7 @@ absl::optional<grpc::Status> GetStatusForRpcBehaviorMetadata(
           absl::StrCat("Unsupported rpc behavior header: ", header_value));
     }
   }
-  return absl::nullopt;
+  return std::nullopt;
 }
 
 void RunServer(bool secure_mode, int port, const int maintenance_port,

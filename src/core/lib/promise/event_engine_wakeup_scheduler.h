@@ -21,8 +21,8 @@
 #include <memory>
 #include <utility>
 
-#include "absl/log/check.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
+#include "src/core/util/grpc_check.h"
 
 namespace grpc_core {
 
@@ -34,7 +34,7 @@ class EventEngineWakeupScheduler {
       std::shared_ptr<grpc_event_engine::experimental::EventEngine>
           event_engine)
       : event_engine_(std::move(event_engine)) {
-    CHECK_NE(event_engine_, nullptr);
+    GRPC_CHECK_NE(event_engine_, nullptr);
   }
 
   template <typename ActivityType>
@@ -47,7 +47,6 @@ class EventEngineWakeupScheduler {
     BoundScheduler& operator=(const BoundScheduler&) = delete;
     void ScheduleWakeup() { event_engine_->Run(this); }
     void Run() final {
-      ApplicationCallbackExecCtx app_exec_ctx;
       ExecCtx exec_ctx;
       static_cast<ActivityType*>(this)->RunScheduledWakeup();
     }

@@ -20,16 +20,16 @@
 
 #include <grpc/grpc.h>
 #include <grpc/support/alloc.h>
-#include <gtest/gtest.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 
-#include "src/core/lib/security/security_connector/security_connector.h"
+#include "src/core/credentials/transport/security_connector.h"
 #include "src/core/tsi/transport_security.h"
 #include "src/core/util/crash.h"
 #include "test/core/test_util/test_config.h"
 #include "test/core/tsi/transport_security_test_lib.h"
+#include "gtest/gtest.h"
 
 typedef struct fake_tsi_test_fixture {
   tsi_test_fixture base;

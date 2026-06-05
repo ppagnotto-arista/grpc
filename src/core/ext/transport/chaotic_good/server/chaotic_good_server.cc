@@ -26,11 +26,9 @@
 #include <utility>
 #include <vector>
 
-#include "absl/log/check.h"
-#include "absl/log/log.h"
-#include "absl/random/bit_gen_ref.h"
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
+#include "src/core/call/metadata.h"
+#include "src/core/call/metadata_batch.h"
+#include "src/core/ext/transport/chaotic_good/config.h"
 #include "src/core/ext/transport/chaotic_good/frame.h"
 #include "src/core/ext/transport/chaotic_good/frame_header.h"
 #include "src/core/ext/transport/chaotic_good/server_transport.h"
@@ -40,8 +38,11 @@
 #include "src/core/lib/event_engine/channel_args_endpoint_config.h"
 #include "src/core/lib/event_engine/event_engine_context.h"
 #include "src/core/lib/event_engine/extensions/chaotic_good_extension.h"
+#include "src/core/lib/event_engine/extensions/supports_fd.h"
+#include "src/core/lib/event_engine/posix.h"
 #include "src/core/lib/event_engine/query_extensions.h"
 #include "src/core/lib/event_engine/resolved_address_internal.h"
+#include "src/core/lib/event_engine/shim.h"
 #include "src/core/lib/event_engine/tcp_socket_utils.h"
 #include "src/core/lib/event_engine/utils.h"
 #include "src/core/lib/iomgr/error.h"
@@ -60,21 +61,51 @@
 #include "src/core/lib/slice/slice.h"
 #include "src/core/lib/slice/slice_buffer.h"
 #include "src/core/lib/transport/error_utils.h"
-#include "src/core/lib/transport/metadata.h"
-#include "src/core/lib/transport/metadata_batch.h"
 #include "src/core/lib/transport/promise_endpoint.h"
 #include "src/core/server/server.h"
+#include "src/core/telemetry/metrics.h"
+#include "src/core/transport/auth_context.h"
+#include "src/core/util/grpc_check.h"
 #include "src/core/util/orphanable.h"
 #include "src/core/util/ref_counted_ptr.h"
 #include "src/core/util/status_helper.h"
 #include "src/core/util/sync.h"
 #include "src/core/util/time.h"
+#include "absl/log/log.h"
+#include "absl/random/bit_gen_ref.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 
 namespace grpc_core {
 namespace chaotic_good {
 
 namespace {
 const Duration kConnectionDeadline = Duration::Seconds(120);
+
+void LogInitFailure(Server* server, std::string what,
+                    std::optional<absl::Status> status) {
+  LOG(ERROR) << "ChaoticGoodServerListener Init failed: " << what
+             << " with status: "
+             << (status.has_value() ? status->ToString() : "no status");
+  auto* server_node = server->channelz_node();
+  if (server_node != nullptr) {
+    if (status.has_value()) {
+      server_node->NewTraceNode(std::move(what), ": ", *status).Commit();
+    } else {
+      server_node->NewTraceNode(std::move(what)).Commit();
+    }
+  }
+}
+
+void LogInformational(Server* server, std::string what) {
+  VLOG(2) << "ChaoticGoodServerListener: " << what;
+  auto* server_node = server->channelz_node();
+  if (server_node != nullptr) {
+    server_node->NewTraceNode(std::move(what)).Commit();
+  }
+}
+
 }  // namespace
 
 using grpc_event_engine::experimental::EventEngine;
@@ -86,7 +117,11 @@ ChaoticGoodServerListener::ChaoticGoodServerListener(
       args_(args),
       event_engine_(
           args.GetObjectRef<grpc_event_engine::experimental::EventEngine>()),
-      connection_id_generator_(std::move(connection_id_generator)) {}
+      data_connection_listener_(MakeRefCounted<DataConnectionListener>(
+          std::move(connection_id_generator),
+          args.GetDurationFromIntMillis(GRPC_ARG_SERVER_HANDSHAKE_TIMEOUT_MS)
+              .value_or(kConnectionDeadline),
+          event_engine_)) {}
 
 ChaoticGoodServerListener::~ChaoticGoodServerListener() {
   if (on_destroy_done_ != nullptr) {
@@ -97,6 +132,80 @@ ChaoticGoodServerListener::~ChaoticGoodServerListener() {
   }
 }
 
+absl::StatusOr<
+    std::unique_ptr<grpc_event_engine::experimental::EventEngine::Listener>>
+ChaoticGoodServerListener::CreateListener(bool must_be_posix) {
+  GRPC_CHECK_NE(event_engine_, nullptr);
+  auto* event_engine_supports_fd =
+      grpc_event_engine::experimental::QueryExtension<
+          grpc_event_engine::experimental::EventEngineSupportsFdExtension>(
+          event_engine_.get());
+  if (must_be_posix && event_engine_supports_fd == nullptr) {
+    LogInitFailure(server_,
+                   "EventEngine does not support external fd listeners",
+                   absl::InternalError(
+                       "EventEngine does not support external fd listeners"));
+    return absl::InternalError(
+        "EventEngine does not support external fd listeners");
+  }
+  auto shutdown_cb =
+      [self = RefAsSubclass<ChaoticGoodServerListener>()](absl::Status status) {
+        if (!status.ok()) {
+          self->LogConnectionFailure("Server accept connection failed", status);
+        }
+      };
+  if (event_engine_supports_fd != nullptr) {
+    grpc_event_engine::experimental::PosixEventEngineWithFdSupport::
+        PosixAcceptCallback accept_cb =
+            [self = RefAsSubclass<ChaoticGoodServerListener>()](
+                int listener_fd, std::unique_ptr<EventEngine::Endpoint> ep,
+                bool is_external, MemoryAllocator,
+                grpc_event_engine::experimental::SliceBuffer* pending_data) {
+              ExecCtx exec_ctx;
+              LogInformational(
+                  self->server_,
+                  absl::StrCat("Accepting connection: ",
+                               ResolvedAddressToString(ep->GetPeerAddress())
+                                   .value_or("<<unknown peer address>>")));
+              grpc_byte_buffer* pending_buf = nullptr;
+              if (pending_data != nullptr && pending_data->Length() > 0) {
+                pending_buf = grpc_raw_byte_buffer_create(nullptr, 0);
+                grpc_slice_buffer_swap(&pending_buf->data.raw.slice_buffer,
+                                       pending_data->c_slice_buffer());
+              }
+              MutexLock lock(&self->mu_);
+              if (self->shutdown_) return;
+              self->connection_list_.emplace(MakeOrphanable<ActiveConnection>(
+                  self, std::move(ep), is_external, listener_fd, pending_buf));
+            };
+    return event_engine_supports_fd->CreatePosixListener(
+        std::move(accept_cb), std::move(shutdown_cb),
+        grpc_event_engine::experimental::ChannelArgsEndpointConfig(args_),
+        std::make_unique<MemoryQuota>(
+            MakeRefCounted<channelz::ResourceQuotaNode>(
+                "chaotic_good_server_listener")));
+  }
+  EventEngine::Listener::AcceptCallback accept_cb =
+      [self = RefAsSubclass<ChaoticGoodServerListener>()](
+          std::unique_ptr<EventEngine::Endpoint> ep, MemoryAllocator) {
+        ExecCtx exec_ctx;
+        LogInformational(
+            self->server_,
+            absl::StrCat("Accepting connection: ",
+                         ResolvedAddressToString(ep->GetPeerAddress())
+                             .value_or("<<unknown peer address>>")));
+        MutexLock lock(&self->mu_);
+        if (self->shutdown_) return;
+        self->connection_list_.emplace(MakeOrphanable<ActiveConnection>(
+            self, std::move(ep), false, 0, nullptr));
+      };
+  return event_engine_->CreateListener(
+      std::move(accept_cb), std::move(shutdown_cb),
+      grpc_event_engine::experimental::ChannelArgsEndpointConfig(args_),
+      std::make_unique<MemoryQuota>(MakeRefCounted<channelz::ResourceQuotaNode>(
+          "chaotic_good_server_listener")));
+}
+
 absl::StatusOr<int> ChaoticGoodServerListener::Bind(
     grpc_event_engine::experimental::EventEngine::ResolvedAddress addr) {
   if (GRPC_TRACE_FLAG_ENABLED(chaotic_good)) {
@@ -104,27 +213,9 @@ absl::StatusOr<int> ChaoticGoodServerListener::Bind(
     LOG(INFO) << "CHAOTIC_GOOD: Listen on "
               << (str.ok() ? str->c_str() : str.status().ToString());
   }
-  EventEngine::Listener::AcceptCallback accept_cb =
-      [self = RefAsSubclass<ChaoticGoodServerListener>()](
-          std::unique_ptr<EventEngine::Endpoint> ep, MemoryAllocator) {
-        ExecCtx exec_ctx;
-        MutexLock lock(&self->mu_);
-        if (self->shutdown_) return;
-        self->connection_list_.emplace(
-            MakeOrphanable<ActiveConnection>(self, std::move(ep)));
-      };
-  auto shutdown_cb = [](absl::Status status) {
-    if (!status.ok()) {
-      LOG(ERROR) << "Server accept connection failed: " << status;
-    }
-  };
-  CHECK_NE(event_engine_, nullptr);
-  auto ee_listener = event_engine_->CreateListener(
-      std::move(accept_cb), std::move(shutdown_cb),
-      grpc_event_engine::experimental::ChannelArgsEndpointConfig(args_),
-      std::make_unique<MemoryQuota>("chaotic_good_server_listener"));
+  auto ee_listener = CreateListener(/*must_be_posix=*/false);
   if (!ee_listener.ok()) {
-    LOG(ERROR) << "Bind failed: " << ee_listener.status().ToString();
+    LogInitFailure(server_, "Bind failed", ee_listener.status());
     return ee_listener.status();
   }
   ee_listener_ = std::move(ee_listener.value());
@@ -135,11 +226,62 @@ absl::StatusOr<int> ChaoticGoodServerListener::Bind(
   return port_num;
 }
 
+absl::Status ChaoticGoodServerListener::BindExternal(std::string addr,
+                                                     const ChannelArgs& args) {
+  using grpc_event_engine::experimental::EventEngine;
+  class FdHandler final : public TcpServerFdHandler {
+   public:
+    FdHandler(RefCountedPtr<ChaoticGoodServerListener> listener,
+              grpc_event_engine::experimental::ListenerSupportsFdExtension*
+                  listener_supports_fd)
+        : listener_(std::move(listener)),
+          listener_supports_fd_(listener_supports_fd) {}
+
+    void Handle(int listener_fd, int fd,
+                grpc_byte_buffer* pending_read) override {
+      grpc_event_engine::experimental::SliceBuffer pending_data;
+      if (pending_read != nullptr) {
+        pending_data =
+            grpc_event_engine::experimental::SliceBuffer::TakeCSliceBuffer(
+                pending_read->data.raw.slice_buffer);
+      }
+      GRPC_LOG_IF_ERROR("listener_handle_external_connection",
+                        listener_supports_fd_->HandleExternalConnection(
+                            listener_fd, fd, &pending_data));
+    }
+
+   private:
+    RefCountedPtr<ChaoticGoodServerListener> listener_;
+    grpc_event_engine::experimental::ListenerSupportsFdExtension*
+        listener_supports_fd_;
+  };
+  auto listener = CreateListener(/*must_be_posix=*/true);
+  if (!listener.ok()) {
+    LogInitFailure(server_, "BindExternal failed", listener.status());
+    return listener.status();
+  }
+  auto* listener_supports_fd = grpc_event_engine::experimental::QueryExtension<
+      grpc_event_engine::experimental::ListenerSupportsFdExtension>(
+      listener->get());
+  if (listener_supports_fd == nullptr) {
+    LogInitFailure(server_,
+                   "EventEngine does not support external fd listeners",
+                   listener.status());
+    return absl::InternalError(
+        "EventEngine does not support external fd listeners");
+  }
+  ee_listener_ = std::move(*listener);
+  TcpServerFdHandler** arg_val = args.GetPointer<TcpServerFdHandler*>(addr);
+  *arg_val = new FdHandler(RefAsSubclass<ChaoticGoodServerListener>(),
+                           listener_supports_fd);
+  return absl::OkStatus();
+}
+
 absl::Status ChaoticGoodServerListener::StartListening() {
-  CHECK(ee_listener_ != nullptr);
+  GRPC_CHECK(ee_listener_ != nullptr);
   auto status = ee_listener_->Start();
   if (!status.ok()) {
-    LOG(ERROR) << "Start listening failed: " << status;
+    LogInitFailure(server_, "Start listening failed", status);
   } else {
     GRPC_TRACE_LOG(chaotic_good, INFO) << "CHAOTIC_GOOD: Started listening";
   }
@@ -148,8 +290,10 @@ absl::Status ChaoticGoodServerListener::StartListening() {
 
 ChaoticGoodServerListener::ActiveConnection::ActiveConnection(
     RefCountedPtr<ChaoticGoodServerListener> listener,
-    std::unique_ptr<EventEngine::Endpoint> endpoint)
-    : listener_(std::move(listener)), config_(args()) {
+    std::unique_ptr<EventEngine::Endpoint> endpoint, bool is_external,
+    int listener_fd, grpc_byte_buffer* pending_data)
+    : listener_(std::move(listener)),
+      acceptor_{nullptr, 0, 0, is_external, listener_fd, pending_data} {
   arena_->SetContext<grpc_event_engine::experimental::EventEngine>(
       listener_->event_engine_.get());
   handshaking_state_ = MakeRefCounted<HandshakingState>(Ref());
@@ -158,6 +302,9 @@ ChaoticGoodServerListener::ActiveConnection::ActiveConnection(
 
 ChaoticGoodServerListener::ActiveConnection::~ActiveConnection() {
   if (receive_settings_activity_ != nullptr) receive_settings_activity_.reset();
+  if (acceptor_.pending_data != nullptr) {
+    grpc_byte_buffer_destroy(acceptor_.pending_data);
+  }
 }
 
 void ChaoticGoodServerListener::ActiveConnection::Orphan() {
@@ -176,20 +323,112 @@ void ChaoticGoodServerListener::ActiveConnection::Orphan() {
   Unref();
 }
 
-void ChaoticGoodServerListener::ActiveConnection::NewConnectionIDs(
-    size_t count) {
-  MutexLock lock(&listener_->mu_);
-  for (size_t i = 0; i < count; i++) {
-    std::string connection_id;
-    while (true) {
-      connection_id = listener_->connection_id_generator_();
-      if (!listener_->connectivity_map_.contains(connection_id)) {
-        break;
-      }
+ChaoticGoodServerListener::DataConnectionListener::DataConnectionListener(
+    absl::AnyInvocable<std::string()> connection_id_generator,
+    Duration connect_timeout,
+    std::shared_ptr<grpc_event_engine::experimental::EventEngine> event_engine)
+    : connection_id_generator_(std::move(connection_id_generator)),
+      event_engine_(std::move(event_engine)),
+      connect_timeout_(connect_timeout) {}
+
+PendingConnection
+ChaoticGoodServerListener::DataConnectionListener::RequestDataConnection(
+    const ChannelArgs& handshake_result_args) {
+  MutexLock lock(&mu_);
+  std::string connection_id;
+  while (true) {
+    connection_id = connection_id_generator_();
+    if (!pending_connections_.contains(connection_id)) break;
+  }
+  if (shutdown_) {
+    return PendingConnection(connection_id, []() {
+      return absl::UnavailableError("Server shutdown");
+    });
+  }
+  auto latch = std::make_shared<PromiseEndpointLatch>();
+  auto timeout_task = event_engine_->RunAfter(
+      connect_timeout_,
+      [connection_id, self = WeakRefAsSubclass<DataConnectionListener>()]() {
+        self->ConnectionTimeout(connection_id);
+      });
+  pending_connections_.emplace(
+      connection_id,
+      PendingConnectionInfo{
+          latch, timeout_task,
+          handshake_result_args.GetObjectRef<grpc_auth_context>()});
+  return PendingConnection(connection_id,
+                           Map(latch->Wait(), [latch](auto x) { return x; }));
+}
+
+std::optional<
+    ChaoticGoodServerListener::DataConnectionListener::PendingConnectionInfo>
+ChaoticGoodServerListener::DataConnectionListener::Extract(
+    absl::string_view id) {
+  MutexLock lock(&mu_);
+  auto ex = pending_connections_.extract(id);
+  if (ex.empty()) {
+    return std::nullopt;
+  }
+
+  event_engine_->Cancel(ex.mapped().timeout);
+  return ex.mapped();
+}
+
+void ChaoticGoodServerListener::DataConnectionListener::ConnectionTimeout(
+    absl::string_view id) {
+  std::optional<PendingConnectionInfo> pending_connection = Extract(id);
+  if (pending_connection == std::nullopt) {
+    GRPC_TRACE_LOG(chaotic_good, ERROR)
+        << "ConnectionTimeout: connection not found";
+    return;
+  }
+  pending_connection->latch->Set(
+      absl::DeadlineExceededError("Connection timeout"));
+}
+
+void ChaoticGoodServerListener::DataConnectionListener::FinishDataConnection(
+    absl::string_view id, PromiseEndpoint endpoint,
+    RefCountedPtr<grpc_auth_context> auth_context) {
+  auto pending_connection = Extract(id);
+  if (pending_connection == std::nullopt) {
+    GRPC_TRACE_LOG(chaotic_good, ERROR) << "FinishDataConnection: connection "
+                                           "not found";
+    return;
+  }
+
+  if (pending_connection->control_endpoint_auth_context == nullptr) {
+    GRPC_TRACE_LOG(chaotic_good, INFO)
+        << "Control endpoint auth context is null, skipping auth context "
+           "comparison";
+  } else {
+    // Compare the auth context with the one from the control endpoint.
+    // If they are different, drop the connection.
+    std::optional<bool> is_same_peer = auth_context->CompareAuthContext(
+        pending_connection->control_endpoint_auth_context.get());
+    if (is_same_peer.has_value() && !is_same_peer.value()) {
+      GRPC_TRACE_LOG(chaotic_good, ERROR)
+          << "FinishDataConnection: auth context mismatch";
+      pending_connection->latch->Set(
+          absl::UnauthenticatedError("Auth context mismatch"));
+      return;
     }
-    listener_->connectivity_map_.emplace(
-        connection_id, std::make_shared<InterActivityLatch<PromiseEndpoint>>());
-    connection_ids_.emplace_back(std::move(connection_id));
+  }
+
+  pending_connection->latch->Set(std::move(endpoint));
+}
+
+void ChaoticGoodServerListener::DataConnectionListener::Orphaned() {
+  absl::flat_hash_map<std::string, PendingConnectionInfo> pending_connections;
+  {
+    MutexLock lock(&mu_);
+    GRPC_CHECK(!shutdown_);
+    pending_connections = std::move(pending_connections_);
+    pending_connections_.clear();
+    shutdown_ = true;
+  }
+  for (const auto& conn : pending_connections) {
+    event_engine_->Cancel(conn.second.timeout);
+    conn.second.latch->Set(absl::UnavailableError("Server shutdown"));
   }
 }
 
@@ -212,10 +451,17 @@ ChaoticGoodServerListener::ActiveConnection::HandshakingState::HandshakingState(
 
 void ChaoticGoodServerListener::ActiveConnection::HandshakingState::Start(
     std::unique_ptr<EventEngine::Endpoint> endpoint) {
+  CoreConfiguration::Get().handshaker_registry().AddHandshakers(
+      HANDSHAKER_SERVER, connection_->args(), nullptr, handshake_mgr_.get());
+  RefCountedPtr<channelz::BaseNode> base_node =
+      connection_->listener_->server_->channelz_node()->Ref();
   handshake_mgr_->DoHandshake(
       OrphanablePtr<grpc_endpoint>(
           grpc_event_engine_endpoint_create(std::move(endpoint))),
-      connection_->args(), GetConnectionDeadline(), nullptr,
+      connection_->args().SetObject(std::move(base_node)),
+      Timestamp::Now() + connection_->listener_->data_connection_listener_
+                             ->connection_timeout(),
+      &connection_->acceptor_,
       [self = Ref()](absl::StatusOr<HandshakerArgs*> result) {
         self->OnHandshakeDone(std::move(result));
       });
@@ -224,27 +470,46 @@ void ChaoticGoodServerListener::ActiveConnection::HandshakingState::Start(
 auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
     EndpointReadSettingsFrame(RefCountedPtr<HandshakingState> self) {
   return TrySeq(
-      self->connection_->endpoint_.ReadSlice(FrameHeader::kFrameHeaderSize),
+      self->connection_->endpoint_.ReadSlice(TcpFrameHeader::kFrameHeaderSize),
       [self](Slice slice) {
         // Parse frame header
-        auto frame_header = FrameHeader::Parse(reinterpret_cast<const uint8_t*>(
-            GRPC_SLICE_START_PTR(slice.c_slice())));
-        if (frame_header.ok() && frame_header->type != FrameType::kSettings) {
-          frame_header = absl::InternalError("Not a settings frame");
+        auto frame_header =
+            TcpFrameHeader::Parse(reinterpret_cast<const uint8_t*>(
+                GRPC_SLICE_START_PTR(slice.c_slice())));
+        if (frame_header.ok()) {
+          if (frame_header->header.type != FrameType::kSettings) {
+            frame_header = absl::InternalError("Not a settings frame");
+          } else if (frame_header->payload_tag != 0) {
+            frame_header = absl::InternalError("Unexpected connection id");
+          } else if (frame_header->header.stream_id != 0) {
+            frame_header = absl::InternalError("Unexpected stream id");
+          }
         }
+
+        // TODO(aananthv): Maybe do not construct Config twice (once here and
+        // once after we read the settings frame).
+        Config config{self->connection_->args()};
+        if (frame_header.ok() && frame_header->header.payload_length >
+                                     config.max_receive_message_length()) {
+          frame_header = absl::ResourceExhaustedError(absl::StrCat(
+              "SERVER handshake: Received message larger than max (",
+              frame_header->header.payload_length, " vs. ",
+              config.max_receive_message_length(), ")"));
+        }
+
         return If(
             frame_header.ok(),
             [self, &frame_header]() {
               return TrySeq(
                   self->connection_->endpoint_.Read(
-                      frame_header->payload_length),
+                      frame_header->header.payload_length),
                   [frame_header = *frame_header,
                    self](SliceBuffer buffer) -> absl::StatusOr<bool> {
                     // Read Setting frame.
                     SettingsFrame frame;
                     // Deserialize frame from read buffer.
-                    auto status =
-                        frame.Deserialize(frame_header, std::move(buffer));
+                    auto status = frame.Deserialize(frame_header.header,
+                                                    std::move(buffer));
                     if (!status.ok()) return status;
                     if (frame.body.data_channel()) {
                       if (frame.body.connection_id().empty()) {
@@ -257,21 +522,26 @@ auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
                             " connection ids in data endpoint "
                             "settings frame (expect one)"));
                       }
-                      if (frame.body.alignment() == 0) {
-                        return absl::UnavailableError(
-                            "no alignment in data endpoint settings frame");
-                      }
-                      // Get connection-id and data-alignment for data endpoint.
-                      self->connection_->connection_ids_.clear();
-                      self->connection_->connection_ids_.push_back(
+                      self->data_.emplace<DataConnection>(
                           frame.body.connection_id()[0]);
-                      self->connection_->data_alignment_ =
-                          frame.body.alignment();
                     } else {
+                      Config config{self->connection_->args()};
                       auto settings_status =
-                          self->connection_->config_.ReceiveIncomingSettings(
-                              frame.body);
+                          config.ReceiveClientIncomingSettings(frame.body);
                       if (!settings_status.ok()) return settings_status;
+                      const int num_data_connections =
+                          self->connection_->listener_->args()
+                              .GetInt(GRPC_ARG_CHAOTIC_GOOD_DATA_CONNECTIONS)
+                              .value_or(1);
+                      auto& data_connection_listener =
+                          *self->connection_->listener_
+                               ->data_connection_listener_;
+                      for (int i = 0; i < num_data_connections; i++) {
+                        config.ServerAddPendingDataEndpoint(
+                            data_connection_listener.RequestDataConnection(
+                                self->connection_->handshake_result_args()));
+                      }
+                      self->data_.emplace<ControlConnection>(std::move(config));
                     }
                     return !frame.body.data_channel();
                   });
@@ -285,79 +555,36 @@ auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
 }
 
 auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
-    WaitForDataEndpointSetup(RefCountedPtr<HandshakingState> self) {
-  return Race(
-      TrySeq(
-          []() {
-            // TODO(ladynana): find a way to resolve SeqState to actual
-            // value.
-            return absl::OkStatus();
-          },
-          [self]() {
-            MutexLock lock(&self->connection_->listener_->mu_);
-            return JoinIter(
-                self->connection_->connection_ids_.begin(),
-                self->connection_->connection_ids_.end(),
-                [self](const std::string& connection_id) {
-                  self->connection_->listener_->mu_.AssertHeld();
-                  auto latch = self->connection_->listener_->connectivity_map_
-                                   .find(connection_id)
-                                   ->second;
-                  return latch->Wait();
-                });
-          },
-          [self](std::vector<PromiseEndpoint> ret) -> absl::Status {
-            MutexLock lock(&self->connection_->listener_->mu_);
-            GRPC_TRACE_LOG(chaotic_good, INFO)
-                << self->connection_.get()
-                << " Data endpoint setup done: shutdown="
-                << (self->connection_->listener_->shutdown_ ? "true" : "false");
-            if (self->connection_->listener_->shutdown_) {
-              return absl::UnavailableError("Server shutdown");
-            }
-            return self->connection_->listener_->server_->SetupTransport(
-                new ChaoticGoodServerTransport(
-                    self->connection_->args(),
-                    std::move(self->connection_->endpoint_), std::move(ret),
-                    self->connection_->listener_->event_engine_,
-                    self->connection_->config_),
-                nullptr, self->connection_->args(), nullptr);
-          }),
-      // Set timeout for waiting data endpoint connect.
-      TrySeq(
-          // []() {
-          Sleep(Timestamp::Now() + kConnectionDeadline),
-          [self]() mutable -> absl::Status {
-            MutexLock lock(&self->connection_->listener_->mu_);
-            // Delete connection ids from map when timeout;
-            for (const std::string& connection_id :
-                 self->connection_->connection_ids_) {
-              self->connection_->listener_->connectivity_map_.erase(
-                  connection_id);
-            }
-            return absl::DeadlineExceededError("Deadline exceeded.");
-          }));
-}
-
-auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
     ControlEndpointWriteSettingsFrame(RefCountedPtr<HandshakingState> self) {
-  self->connection_->NewConnectionIDs(
-      self->connection_->listener_->args()
-          .GetInt(GRPC_ARG_CHAOTIC_GOOD_DATA_CONNECTIONS)
-          .value_or(1));
   SettingsFrame frame;
   frame.body.set_data_channel(false);
-  for (const auto& connection_id : self->connection_->connection_ids_) {
-    frame.body.add_connection_id(connection_id);
-  }
-  self->connection_->config_.PrepareOutgoingSettings(frame.body);
+  std::get<ControlConnection>(self->data_)
+      .config.PrepareServerOutgoingSettings(frame.body);
   SliceBuffer write_buffer;
-  frame.MakeHeader().Serialize(
-      write_buffer.AddTiny(FrameHeader::kFrameHeaderSize));
+  TcpFrameHeader{frame.MakeHeader(), 0}.Serialize(
+      write_buffer.AddTiny(TcpFrameHeader::kFrameHeaderSize));
   frame.SerializePayload(write_buffer);
-  // ignore encoding errors: they will be logged separately already
-  return TrySeq(self->connection_->endpoint_.Write(std::move(write_buffer)),
-                WaitForDataEndpointSetup(self));
+  return TrySeq(
+      self->connection_->endpoint_.Write(std::move(write_buffer),
+                                         PromiseEndpoint::WriteArgs{}),
+      [self]() {
+        auto config =
+            std::move(std::get<ControlConnection>(self->data_).config);
+        auto& ep = self->connection_->endpoint_;
+        auto socket_node =
+            TcpFrameTransport::MakeSocketNode(self->connection_->args(), ep);
+        auto frame_transport = MakeOrphanable<TcpFrameTransport>(
+            config.MakeTcpFrameTransportOptions(), std::move(ep),
+            config.TakePendingDataEndpoints(),
+            MakeRefCounted<TransportContext>(
+                self->connection_->handshake_result_args(),
+                std::move(socket_node)));
+        return self->connection_->listener_->server_->SetupTransport(
+            new ChaoticGoodServerTransport(
+                self->connection_->handshake_result_args(),
+                std::move(frame_transport), config.MakeMessageChunker()),
+            nullptr, self->connection_->handshake_result_args());
+      });
 }
 
 auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
@@ -365,28 +592,22 @@ auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
   // Send data endpoint setting frame
   SettingsFrame frame;
   frame.body.set_data_channel(true);
-  frame.body.set_alignment(self->connection_->data_alignment_);
   SliceBuffer write_buffer;
-  frame.MakeHeader().Serialize(
-      write_buffer.AddTiny(FrameHeader::kFrameHeaderSize));
+  TcpFrameHeader{frame.MakeHeader(), 0}.Serialize(
+      write_buffer.AddTiny(TcpFrameHeader::kFrameHeaderSize));
   frame.SerializePayload(write_buffer);
   // ignore encoding errors: they will be logged separately already
-  return TrySeq(
-      self->connection_->endpoint_.Write(std::move(write_buffer)),
-      [self]() mutable {
-        MutexLock lock(&self->connection_->listener_->mu_);
-        // Set endpoint to latch
-        CHECK_EQ(self->connection_->connection_ids_.size(), 1ull);
-        auto it = self->connection_->listener_->connectivity_map_.find(
-            self->connection_->connection_ids_[0]);
-        if (it == self->connection_->listener_->connectivity_map_.end()) {
-          return absl::InternalError(absl::StrCat(
-              "Connection not in map: ",
-              absl::CEscape(self->connection_->connection_ids_[0])));
-        }
-        it->second->Set(std::move(self->connection_->endpoint_));
-        return absl::OkStatus();
-      });
+  return TrySeq(self->connection_->endpoint_.Write(
+                    std::move(write_buffer), PromiseEndpoint::WriteArgs{}),
+                [self]() mutable {
+                  self->connection_->listener_->data_connection_listener_
+                      ->FinishDataConnection(
+                          std::get<DataConnection>(self->data_).connection_id,
+                          std::move(self->connection_->endpoint_),
+                          self->connection_->handshake_result_args_
+                              ->GetObjectRef<grpc_auth_context>());
+                  return absl::OkStatus();
+                });
 }
 
 auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
@@ -401,18 +622,19 @@ auto ChaoticGoodServerListener::ActiveConnection::HandshakingState::
 void ChaoticGoodServerListener::ActiveConnection::HandshakingState::
     OnHandshakeDone(absl::StatusOr<HandshakerArgs*> result) {
   if (!result.ok()) {
-    LOG_EVERY_N_SEC(ERROR, 5) << "Handshake failed: ", result.status();
+    connection_->listener_->LogConnectionFailure("Handshake failed",
+                                                 result.status());
     connection_->Done();
     return;
   }
-  CHECK_NE(*result, nullptr);
+  GRPC_CHECK_NE(*result, nullptr);
   if ((*result)->endpoint == nullptr) {
-    LOG_EVERY_N_SEC(ERROR, 5)
-        << "Server handshake done but has empty endpoint.";
+    connection_->listener_->LogConnectionFailure(
+        "Server handshake done but has empty endpoint", std::nullopt);
     connection_->Done();
     return;
   }
-  CHECK(grpc_event_engine::experimental::grpc_is_event_engine_endpoint(
+  GRPC_CHECK(grpc_event_engine::experimental::grpc_is_event_engine_endpoint(
       (*result)->endpoint.get()));
   auto ee_endpoint =
       grpc_event_engine::experimental::grpc_take_wrapped_event_engine_endpoint(
@@ -421,6 +643,7 @@ void ChaoticGoodServerListener::ActiveConnection::HandshakingState::
       grpc_event_engine::experimental::ChaoticGoodExtension>(ee_endpoint.get());
   connection_->endpoint_ =
       PromiseEndpoint(std::move(ee_endpoint), SliceBuffer());
+  connection_->handshake_result_args_ = (*result)->args;
   auto activity = MakeActivity(
       [self = Ref(), chaotic_good_ext]() {
         return TrySeq(
@@ -445,8 +668,8 @@ void ChaoticGoodServerListener::ActiveConnection::HandshakingState::
       EventEngineWakeupScheduler(connection_->listener_->event_engine_),
       [self = Ref()](absl::Status status) {
         if (!status.ok()) {
-          GRPC_TRACE_LOG(chaotic_good, ERROR)
-              << "Server setting frame handling failed: " << status;
+          self->connection_->listener_->LogConnectionFailure(
+              "Chaotic Good handshake failed", status);
         }
         self->connection_->Done();
       },
@@ -454,14 +677,6 @@ void ChaoticGoodServerListener::ActiveConnection::HandshakingState::
   MutexLock lock(&connection_->mu_);
   if (connection_->orphaned_) return;
   connection_->receive_settings_activity_ = std::move(activity);
-}
-
-Timestamp ChaoticGoodServerListener::ActiveConnection::HandshakingState::
-    GetConnectionDeadline() {
-  return Timestamp::Now() +
-         connection_->args()
-             .GetDurationFromIntMillis(GRPC_ARG_SERVER_HANDSHAKE_TIMEOUT_MS)
-             .value_or(kConnectionDeadline);
 }
 
 void ChaoticGoodServerListener::Orphan() {
@@ -477,45 +692,51 @@ void ChaoticGoodServerListener::Orphan() {
   Unref();
 };
 
-}  // namespace chaotic_good
-}  // namespace grpc_core
-
-int grpc_server_add_chaotic_good_port(grpc_server* server, const char* addr) {
-  using grpc_event_engine::experimental::EventEngine;
-  if (grpc_core::IsChaoticGoodLegacyProtocolEnabled()) {
-    return grpc_server_add_chaotic_good_legacy_port(server, addr);
+absl::StatusOr<int> AddChaoticGoodPort(Server* server, std::string addr,
+                                       const ChannelArgs& args) {
+  if (!IsChaoticGoodFramingLayerEnabled()) {
+    return chaotic_good_legacy::AddLegacyChaoticGoodPort(server, addr, args);
   }
-  grpc_core::ExecCtx exec_ctx;
-  auto* const core_server = grpc_core::Server::FromC(server);
-  const std::string parsed_addr = grpc_core::URI::PercentDecode(addr);
+  if (absl::StartsWith(addr, "external:")) {
+    auto listener =
+        MakeOrphanable<chaotic_good::ChaoticGoodServerListener>(server, args);
+    if (auto status = listener->BindExternal(addr, args); !status.ok()) {
+      return status;
+    }
+    server->AddListener(std::move(listener));
+    return -1;
+  }
+  using grpc_event_engine::experimental::EventEngine;
+  const std::string parsed_addr = URI::PercentDecode(addr);
   absl::StatusOr<std::vector<EventEngine::ResolvedAddress>> results =
       std::vector<EventEngine::ResolvedAddress>();
-  if (grpc_core::IsEventEngineDnsNonClientChannelEnabled()) {
+  if (IsEventEngineDnsNonClientChannelEnabled() &&
+      !grpc_event_engine::experimental::
+          EventEngineExperimentDisabledForPython()) {
     absl::StatusOr<std::unique_ptr<EventEngine::DNSResolver>> ee_resolver =
-        core_server->channel_args().GetObjectRef<EventEngine>()->GetDNSResolver(
+        args.GetObjectRef<EventEngine>()->GetDNSResolver(
             EventEngine::DNSResolver::ResolverOptions());
     if (!ee_resolver.ok()) {
-      LOG(ERROR) << "Failed to resolve " << addr << ": "
-                 << ee_resolver.status().ToString();
-      return 0;
+      LogInitFailure(server, absl::StrCat("Failed to resolve ", addr),
+                     ee_resolver.status());
+      return ee_resolver.status();
     }
     results = grpc_event_engine::experimental::LookupHostnameBlocking(
         ee_resolver->get(), parsed_addr, absl::StrCat(0xd20));
     if (!results.ok()) {
-      LOG(ERROR) << "Failed to resolve " << addr << ": "
-                 << results.status().ToString();
-      return 0;
+      LogInitFailure(server, absl::StrCat("Failed to resolve ", addr),
+                     results.status());
+      return results.status();
     }
   } else {
     // TODO(yijiem): Remove this after event_engine_dns_non_client_channel
     // is fully enabled.
-    const auto resolved_or =
-        grpc_core::GetDNSResolver()->LookupHostnameBlocking(
-            parsed_addr, absl::StrCat(0xd20));
+    const auto resolved_or = GetDNSResolver()->LookupHostnameBlocking(
+        parsed_addr, absl::StrCat(0xd20));
     if (!resolved_or.ok()) {
-      LOG(ERROR) << "Failed to resolve " << addr << ": "
-                 << resolved_or.status().ToString();
-      return 0;
+      LogInitFailure(server, absl::StrCat("Failed to resolve ", addr),
+                     resolved_or.status());
+      return resolved_or.status();
     }
     for (const auto& addr : *resolved_or) {
       results->push_back(
@@ -525,26 +746,30 @@ int grpc_server_add_chaotic_good_port(grpc_server* server, const char* addr) {
   int port_num = 0;
   std::vector<std::pair<std::string, absl::Status>> error_list;
   for (const auto& ee_addr : results.value()) {
-    auto listener = grpc_core::MakeOrphanable<
-        grpc_core::chaotic_good::ChaoticGoodServerListener>(
-        core_server, core_server->channel_args());
+    auto listener =
+        MakeOrphanable<chaotic_good::ChaoticGoodServerListener>(server, args);
     std::string addr_str =
         *grpc_event_engine::experimental::ResolvedAddressToString(ee_addr);
     GRPC_TRACE_LOG(chaotic_good, INFO) << "BIND: " << addr_str;
     auto bind_result = listener->Bind(ee_addr);
     if (!bind_result.ok()) {
+      LogInitFailure(server, absl::StrCat("Failed to bind ", addr_str),
+                     bind_result.status());
       error_list.push_back(
-          std::make_pair(std::move(addr_str), bind_result.status()));
+          std::pair(std::move(addr_str), bind_result.status()));
       continue;
     }
     if (port_num == 0) {
       port_num = bind_result.value();
     } else {
-      CHECK(port_num == bind_result.value());
+      GRPC_CHECK(port_num == bind_result.value());
     }
-    core_server->AddListener(std::move(listener));
+    server->AddListener(std::move(listener));
   }
   if (error_list.size() == results->size()) {
+    LogInitFailure(server,
+                   absl::StrCat("Failed to bind any address for ", addr),
+                   std::nullopt);
     LOG(ERROR) << "Failed to bind any address for " << addr;
     for (const auto& error : error_list) {
       LOG(ERROR) << "  " << error.first << ": " << error.second;
@@ -558,3 +783,6 @@ int grpc_server_add_chaotic_good_port(grpc_server* server, const char* addr) {
   }
   return port_num;
 }
+
+}  // namespace chaotic_good
+}  // namespace grpc_core

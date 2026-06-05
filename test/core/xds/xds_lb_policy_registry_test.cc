@@ -26,8 +26,6 @@
 
 #include <string>
 
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
 #include "envoy/config/cluster/v3/cluster.pb.h"
 #include "envoy/config/core/v3/extension.pb.h"
 #include "envoy/extensions/load_balancing_policies/client_side_weighted_round_robin/v3/client_side_weighted_round_robin.pb.h"
@@ -35,8 +33,6 @@
 #include "envoy/extensions/load_balancing_policies/ring_hash/v3/ring_hash.pb.h"
 #include "envoy/extensions/load_balancing_policies/round_robin/v3/round_robin.pb.h"
 #include "envoy/extensions/load_balancing_policies/wrr_locality/v3/wrr_locality.pb.h"
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/load_balancing/lb_policy.h"
 #include "src/core/load_balancing/lb_policy_factory.h"
@@ -46,10 +42,15 @@
 #include "src/core/util/ref_counted_ptr.h"
 #include "src/core/util/validation_errors.h"
 #include "src/core/xds/grpc/xds_bootstrap_grpc.h"
+#include "test/core/test_util/scoped_env_var.h"
 #include "test/core/test_util/test_config.h"
 #include "upb/mem/arena.hpp"
 #include "upb/reflection/def.hpp"
 #include "xds/type/v3/typed_struct.pb.h"
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 
 namespace grpc_core {
 namespace testing {
@@ -73,7 +74,7 @@ absl::StatusOr<std::string> ConvertXdsPolicy(
   std::string serialized_policy = policy.SerializeAsString();
   upb::Arena arena;
   upb::DefPool def_pool;
-  XdsResourceType::DecodeContext context = {nullptr, GrpcXdsServer(), nullptr,
+  XdsResourceType::DecodeContext context = {nullptr, GrpcXdsServer(),
                                             def_pool.ptr(), arena.ptr()};
   auto* upb_policy = envoy_config_cluster_v3_LoadBalancingPolicy_parse(
       serialized_policy.data(), serialized_policy.size(), arena.ptr());
@@ -145,6 +146,7 @@ TEST(ClientSideWeightedRoundRobinTest, FieldsExplicitlySet) {
   wrr.mutable_weight_expiration_period()->set_seconds(3);
   wrr.mutable_weight_update_period()->set_seconds(4);
   wrr.mutable_error_utilization_penalty()->set_value(5.0);
+  wrr.add_metric_names_for_computing_utilization("cpu_usage");
   LoadBalancingPolicyProto policy;
   policy.add_policies()
       ->mutable_typed_extension_config()
@@ -161,6 +163,36 @@ TEST(ClientSideWeightedRoundRobinTest, FieldsExplicitlySet) {
             "\"weightExpirationPeriod\":\"3.000000000s\","
             "\"weightUpdatePeriod\":\"4.000000000s\""
             "}}");
+}
+
+TEST(ClientSideWeightedRoundRobinTest, WrrCustomMetricsEnabled) {
+  ScopedExperimentalEnvVar env_var("GRPC_EXPERIMENTAL_WRR_CUSTOM_METRICS");
+  ClientSideWeightedRoundRobin wrr;
+  wrr.add_metric_names_for_computing_utilization("cpu_usage");
+  LoadBalancingPolicyProto policy;
+  policy.add_policies()
+      ->mutable_typed_extension_config()
+      ->mutable_typed_config()
+      ->PackFrom(wrr);
+  auto result = ConvertXdsPolicy(policy);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(*result,
+            "{\"weighted_round_robin\":{"
+            "\"metricNamesForComputingUtilization\":[\"cpu_usage\"]"
+            "}}");
+}
+
+TEST(ClientSideWeightedRoundRobinTest, WrrCustomMetricsDisabled) {
+  ClientSideWeightedRoundRobin wrr;
+  wrr.add_metric_names_for_computing_utilization("cpu_usage");
+  LoadBalancingPolicyProto policy;
+  policy.add_policies()
+      ->mutable_typed_extension_config()
+      ->mutable_typed_config()
+      ->PackFrom(wrr);
+  auto result = ConvertXdsPolicy(policy);
+  ASSERT_TRUE(result.ok()) << result.status();
+  EXPECT_EQ(*result, "{\"weighted_round_robin\":{}}");
 }
 
 TEST(ClientSideWeightedRoundRobinTest, InvalidValues) {
@@ -633,7 +665,7 @@ TEST(XdsLbPolicyRegistryTest, MaxRecursion) {
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   grpc::testing::TestEnvironment env(&argc, argv);
-  grpc_core::CoreConfiguration::RegisterBuilder(
+  grpc_core::CoreConfiguration::RegisterEphemeralBuilder(
       [](grpc_core::CoreConfiguration::Builder* builder) {
         builder->lb_policy_registry()->RegisterLoadBalancingPolicyFactory(
             std::make_unique<grpc_core::testing::CustomLbPolicyFactory>());

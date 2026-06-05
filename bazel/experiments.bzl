@@ -17,43 +17,82 @@
 """Dictionary of tags to experiments so we know when to test different experiments."""
 
 EXPERIMENT_ENABLES = {
-    "backoff_cap_initial_at_max": "backoff_cap_initial_at_max",
+    "buffer_list_deletion_prep": "buffer_list_deletion_prep",
     "call_tracer_in_transport": "call_tracer_in_transport",
-    "canary_client_privacy": "canary_client_privacy",
-    "chaotic_good_legacy_protocol": "chaotic_good_legacy_protocol",
-    "client_privacy": "client_privacy",
-    "disable_buffer_hint_on_high_memory_pressure": "disable_buffer_hint_on_high_memory_pressure",
-    "event_engine_application_callbacks": "event_engine_application_callbacks",
-    "event_engine_callback_cq": "event_engine_application_callbacks,event_engine_callback_cq",
+    "call_tracer_send_initial_metadata_is_an_annotation": "call_tracer_send_initial_metadata_is_an_annotation",
+    "call_tracer_send_trailing_metadata_is_an_annotation": "call_tracer_send_trailing_metadata_is_an_annotation",
+    "callv3_batch_validation": "callv3_batch_validation",
+    "chaotic_good_framing_layer": "chaotic_good_framing_layer",
+    "chaotic_good_send_supported_features": "chaotic_good_send_supported_features",
+    "error_flatten": "error_flatten",
     "event_engine_client": "event_engine_client",
     "event_engine_dns": "event_engine_dns",
     "event_engine_dns_non_client_channel": "event_engine_dns_non_client_channel",
+    "event_engine_fork": "event_engine_fork",
     "event_engine_listener": "event_engine_listener",
+    "event_engine_callback_cq": "event_engine_callback_cq,event_engine_client,event_engine_listener",
+    "event_engine_for_all_other_endpoints": "event_engine_client,event_engine_dns,event_engine_dns_non_client_channel,event_engine_for_all_other_endpoints,event_engine_listener",
+    "event_engine_poller_for_python": "event_engine_poller_for_python",
+    "fail_recv_metadata_on_deadline_exceeded": "fail_recv_metadata_on_deadline_exceeded",
     "free_large_allocator": "free_large_allocator",
+    "fuse_filters": "fuse_filters",
+    "h2_max_deallocating_streams_headroom": "h2_max_deallocating_streams_headroom",
+    "inproc_cancel_stream": "inproc_cancel_stream",
+    "keep_alive_ping_timer_batch": "keep_alive_ping_timer_batch",
     "local_connector_secure": "local_connector_secure",
-    "max_pings_wo_data_throttle": "max_pings_wo_data_throttle",
+    "max_inflight_pings_strict_limit": "max_inflight_pings_strict_limit",
+    "memory_optimization_01": "memory_optimization_01",
+    "memory_optimization_02": "memory_optimization_02",
+    "message_size_refactoring": "message_size_refactoring",
+    "metadata_outstanding_token_refactor": "metadata_outstanding_token_refactor",
+    "metadata_publish_to_app_tag": "metadata_publish_to_app_tag",
     "monitoring_experiment": "monitoring_experiment",
     "multiping": "multiping",
-    "pick_first_new": "pick_first_new",
-    "promise_based_http2_client_transport": "promise_based_http2_client_transport",
-    "promise_based_http2_server_transport": "promise_based_http2_server_transport",
+    "optimization_01": "optimization_01",
+    "optimization_02": "optimization_02",
+    "optimization_03": "optimization_03",
+    "optimization_04": "optimization_04",
+    "otel_export_telemetry_domains": "otel_export_telemetry_domains",
+    "ph2_client": "ph2_client",
+    "ph2_client_server": "ph2_client_server",
+    "ph2_perf_01": "ph2_perf_01",
+    "ph2_server": "ph2_server",
+    "pick_first_ignore_empty_updates": "pick_first_ignore_empty_updates",
+    "pipelined_read_secure_endpoint": "event_engine_client,event_engine_listener,pipelined_read_secure_endpoint",
+    "pollset_alternative": "event_engine_client,event_engine_listener,pollset_alternative",
+    "prioritize_finished_requests": "prioritize_finished_requests",
     "promise_based_inproc_transport": "promise_based_inproc_transport",
-    "rq_fast_reject": "rq_fast_reject",
+    "promise_batch_cleanup_on_cancel": "promise_batch_cleanup_on_cancel",
+    "promise_filter_send_cancel_metadata": "promise_filter_send_cancel_metadata",
+    "retry_in_callv3": "retry_in_callv3",
+    "return_preexisting_errors": "return_preexisting_errors",
     "schedule_cancellation_over_write": "schedule_cancellation_over_write",
-    "server_privacy": "server_privacy",
+    "secure_endpoint_offload_large_reads": "event_engine_client,event_engine_listener,secure_endpoint_offload_large_reads",
+    "secure_endpoint_offload_large_writes": "event_engine_client,event_engine_listener,secure_endpoint_offload_large_writes",
+    "secure_endpoint_read_coalescing": "event_engine_client,event_engine_listener,secure_endpoint_read_coalescing",
+    "skip_clear_peer_on_cancellation": "skip_clear_peer_on_cancellation",
+    "subchannel_connection_scaling": "subchannel_connection_scaling",
+    "subchannel_wrapper_cleanup_on_orphan": "subchannel_wrapper_cleanup_on_orphan",
     "tcp_frame_size_tuning": "tcp_frame_size_tuning",
     "tcp_rcv_lowat": "tcp_rcv_lowat",
-    "time_caching_in_party": "time_caching_in_party",
-    "trace_record_callops": "trace_record_callops",
+    "tsi_frame_protector_without_locks": "tsi_frame_protector_without_locks",
     "unconstrained_max_quota_buffer_size": "unconstrained_max_quota_buffer_size",
-    "work_serializer_dispatch": "work_serializer_dispatch",
+    "use_call_event_engine_in_completion_queue": "use_call_event_engine_in_completion_queue",
+    "v2_non_owning_waker_implementation": "v2_non_owning_waker_implementation",
+    "verbose_channelz_connection_logging": "verbose_channelz_connection_logging",
+    "wildcard_ip_expansion_restriction": "wildcard_ip_expansion_restriction",
+    "xds_server_filter_chain_per_route": "xds_server_filter_chain_per_route",
 }
 
 EXPERIMENT_POLLERS = [
     "event_engine_client",
     "event_engine_dns",
     "event_engine_dns_non_client_channel",
+    "event_engine_fork",
     "event_engine_listener",
+    "event_engine_for_all_other_endpoints",
+    "event_engine_poller_for_python",
+    "pipelined_read_secure_endpoint",
 ]
 
 EXPERIMENTS = {
@@ -62,22 +101,8 @@ EXPERIMENTS = {
         },
         "off": {
             "core_end2end_test": [
-                "chaotic_good_legacy_protocol",
-                "event_engine_dns_non_client_channel",
-                "local_connector_secure",
-            ],
-            "endpoint_test": [
-                "tcp_frame_size_tuning",
-                "tcp_rcv_lowat",
-            ],
-            "flow_control_test": [
-                "multiping",
-                "tcp_frame_size_tuning",
-                "tcp_rcv_lowat",
-            ],
-            "resource_quota_test": [
-                "free_large_allocator",
-                "unconstrained_max_quota_buffer_size",
+                "pollset_alternative",
+                "use_call_event_engine_in_completion_queue",
             ],
         },
         "on": {
@@ -86,31 +111,22 @@ EXPERIMENTS = {
             ],
             "core_end2end_test": [
                 "event_engine_client",
+                "event_engine_dns_non_client_channel",
+                "event_engine_for_all_other_endpoints",
+                "event_engine_fork",
                 "event_engine_listener",
-                "work_serializer_dispatch",
-            ],
-            "cpp_end2end_test": [
-                "work_serializer_dispatch",
-            ],
-            "cpp_lb_end2end_test": [
-                "pick_first_new",
             ],
             "event_engine_client_test": [
                 "event_engine_client",
             ],
+            "event_engine_fork_test": [
+                "event_engine_fork",
+            ],
             "event_engine_listener_test": [
                 "event_engine_listener",
             ],
-            "lb_unit_test": [
-                "pick_first_new",
-                "work_serializer_dispatch",
-            ],
             "resolver_component_tests_runner_invoker": [
                 "event_engine_dns",
-            ],
-            "xds_end2end_test": [
-                "pick_first_new",
-                "work_serializer_dispatch",
             ],
         },
     },
@@ -119,65 +135,8 @@ EXPERIMENTS = {
         },
         "off": {
             "core_end2end_test": [
-                "chaotic_good_legacy_protocol",
-                "event_engine_dns_non_client_channel",
-                "local_connector_secure",
-            ],
-            "endpoint_test": [
-                "tcp_frame_size_tuning",
-                "tcp_rcv_lowat",
-            ],
-            "flow_control_test": [
-                "multiping",
-                "tcp_frame_size_tuning",
-                "tcp_rcv_lowat",
-            ],
-            "resource_quota_test": [
-                "free_large_allocator",
-                "unconstrained_max_quota_buffer_size",
-            ],
-        },
-        "on": {
-            "core_end2end_test": [
-                "work_serializer_dispatch",
-            ],
-            "cpp_end2end_test": [
-                "work_serializer_dispatch",
-            ],
-            "cpp_lb_end2end_test": [
-                "pick_first_new",
-            ],
-            "lb_unit_test": [
-                "pick_first_new",
-                "work_serializer_dispatch",
-            ],
-            "xds_end2end_test": [
-                "pick_first_new",
-                "work_serializer_dispatch",
-            ],
-        },
-    },
-    "posix": {
-        "dbg": {
-        },
-        "off": {
-            "core_end2end_test": [
-                "chaotic_good_legacy_protocol",
-                "event_engine_dns_non_client_channel",
-                "local_connector_secure",
-            ],
-            "endpoint_test": [
-                "tcp_frame_size_tuning",
-                "tcp_rcv_lowat",
-            ],
-            "flow_control_test": [
-                "multiping",
-                "tcp_frame_size_tuning",
-                "tcp_rcv_lowat",
-            ],
-            "resource_quota_test": [
-                "free_large_allocator",
-                "unconstrained_max_quota_buffer_size",
+                "pollset_alternative",
+                "use_call_event_engine_in_completion_queue",
             ],
         },
         "on": {
@@ -186,31 +145,119 @@ EXPERIMENTS = {
             ],
             "core_end2end_test": [
                 "event_engine_client",
+                "event_engine_dns_non_client_channel",
+                "event_engine_for_all_other_endpoints",
+                "event_engine_fork",
                 "event_engine_listener",
-                "work_serializer_dispatch",
-            ],
-            "cpp_end2end_test": [
-                "work_serializer_dispatch",
-            ],
-            "cpp_lb_end2end_test": [
-                "pick_first_new",
             ],
             "event_engine_client_test": [
                 "event_engine_client",
             ],
+            "event_engine_fork_test": [
+                "event_engine_fork",
+            ],
             "event_engine_listener_test": [
                 "event_engine_listener",
             ],
-            "lb_unit_test": [
-                "pick_first_new",
-                "work_serializer_dispatch",
+            "resolver_component_tests_runner_invoker": [
+                "event_engine_dns",
+            ],
+        },
+    },
+    "posix": {
+        "dbg": {
+        },
+        "off": {
+            "chttp2_keepalive_tests": [
+                "subchannel_connection_scaling",
+            ],
+            "core_end2end_test": [
+                "buffer_list_deletion_prep",
+                "chaotic_good_send_supported_features",
+                "local_connector_secure",
+                "otel_export_telemetry_domains",
+                "ph2_client",
+                "pipelined_read_secure_endpoint",
+                "pollset_alternative",
+                "retry_in_callv3",
+                "secure_endpoint_offload_large_reads",
+                "secure_endpoint_offload_large_writes",
+                "secure_endpoint_read_coalescing",
+                "subchannel_connection_scaling",
+                "use_call_event_engine_in_completion_queue",
+                "v2_non_owning_waker_implementation",
+                "wildcard_ip_expansion_restriction",
+            ],
+            "cpp_end2end_test": [
+                "ph2_client",
+            ],
+            "cpp_lb_end2end_test": [
+                "subchannel_connection_scaling",
+            ],
+            "endpoint_test": [
+                "tcp_frame_size_tuning",
+                "tcp_rcv_lowat",
+            ],
+            "flow_control_test": [
+                "multiping",
+                "tcp_frame_size_tuning",
+                "tcp_rcv_lowat",
+            ],
+            "minimal_stack_test": [
+                "fuse_filters",
+            ],
+            "posix_endpoint_test": [
+                "pipelined_read_secure_endpoint",
+            ],
+            "resource_quota_test": [
+                "free_large_allocator",
+                "unconstrained_max_quota_buffer_size",
+            ],
+            "secure_endpoint_test": [
+                "pipelined_read_secure_endpoint",
+            ],
+            "xds_end2end_test": [
+                "xds_server_filter_chain_per_route",
+            ],
+            "xds_test": [
+                "xds_server_filter_chain_per_route",
+            ],
+        },
+        "on": {
+            "cancel_ares_query_test": [
+                "event_engine_dns",
+            ],
+            "core_end2end_test": [
+                "callv3_batch_validation",
+                "error_flatten",
+                "event_engine_client",
+                "event_engine_dns_non_client_channel",
+                "event_engine_for_all_other_endpoints",
+                "event_engine_fork",
+                "event_engine_listener",
+            ],
+            "cpp_end2end_test": [
+                "error_flatten",
+                "subchannel_wrapper_cleanup_on_orphan",
+            ],
+            "error_tests": [
+                "error_flatten",
+            ],
+            "event_engine_client_test": [
+                "event_engine_client",
+            ],
+            "event_engine_fork_test": [
+                "event_engine_fork",
+            ],
+            "event_engine_listener_test": [
+                "event_engine_listener",
             ],
             "resolver_component_tests_runner_invoker": [
                 "event_engine_dns",
             ],
             "xds_end2end_test": [
-                "pick_first_new",
-                "work_serializer_dispatch",
+                "error_flatten",
+                "subchannel_wrapper_cleanup_on_orphan",
             ],
         },
     },

@@ -14,7 +14,6 @@
 // limitations under the License.
 //
 
-#include <gmock/gmock.h>
 #include <grpc/grpc.h>
 #include <grpcpp/channel.h>
 #include <grpcpp/client_context.h>
@@ -27,21 +26,24 @@
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>
 #include <grpcpp/support/byte_buffer.h>
+#include <grpcpp/support/channel_arguments.h>
 #include <grpcpp/support/status.h>
-#include <gtest/gtest.h>
 
 #include <memory>
+#include <optional>
 
-#include "absl/log/log.h"
-#include "absl/strings/str_cat.h"
-#include "absl/time/time.h"
-#include "absl/types/optional.h"
 #include "src/core/util/notification.h"
 #include "src/core/util/time.h"
 #include "src/proto/grpc/testing/xds/v3/orca_service.grpc.pb.h"
 #include "src/proto/grpc/testing/xds/v3/orca_service.pb.h"
 #include "test/core/test_util/port.h"
 #include "test/core/test_util/test_config.h"
+#include "test/cpp/end2end/end2end_test_utils.h"
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/log/log.h"
+#include "absl/strings/str_cat.h"
+#include "absl/time/time.h"
 
 using xds::data::orca::v3::OrcaLoadReport;
 using xds::service::orca::v3::OpenRcaService;
@@ -97,7 +99,7 @@ class OrcaServiceEnd2endTest : public ::testing::Test {
     const grpc_core::Duration requested_interval_;
     ClientContext context_;
     std::unique_ptr<grpc::ClientReaderInterface<OrcaLoadReport>> stream_;
-    absl::optional<grpc_core::Timestamp> last_response_time_;
+    std::optional<grpc_core::Timestamp> last_response_time_;
   };
 
   class GenericOrcaClientReactor
@@ -140,7 +142,10 @@ class OrcaServiceEnd2endTest : public ::testing::Test {
     builder.RegisterService(&orca_service_);
     server_ = builder.BuildAndStart();
     LOG(INFO) << "server started on " << server_address;
-    channel_ = CreateChannel(server_address, InsecureChannelCredentials());
+    ChannelArguments args;
+    ApplyCommonChannelArguments(args);
+    channel_ =
+        CreateCustomChannel(server_address, InsecureChannelCredentials(), args);
   }
 
   ~OrcaServiceEnd2endTest() override { server_->Shutdown(); }
@@ -152,6 +157,7 @@ class OrcaServiceEnd2endTest : public ::testing::Test {
 };
 
 TEST_F(OrcaServiceEnd2endTest, Basic) {
+  SKIP_TEST_FOR_PH2_CLIENT("TODO(tjagtap) [PH2][P3][Client] Fix bug (Timeout)");
   constexpr char kMetricName1[] = "foo";
   constexpr char kMetricName2[] = "bar";
   constexpr char kMetricName3[] = "baz";

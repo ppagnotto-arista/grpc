@@ -26,8 +26,6 @@
 #include <memory>
 #include <string>
 
-#include "absl/container/flat_hash_map.h"
-#include "absl/status/status.h"
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/lib/iomgr/closure.h"
 #include "src/core/lib/iomgr/error.h"
@@ -36,8 +34,11 @@
 #include "src/core/util/orphanable.h"
 #include "src/core/util/ref_counted_ptr.h"
 #include "src/core/util/sync.h"
+#include "src/core/xds/grpc/certificate_provider_store_interface.h"
 #include "src/core/xds/xds_client/xds_bootstrap.h"
 #include "src/core/xds/xds_client/xds_transport.h"
+#include "absl/container/flat_hash_map.h"
+#include "absl/status/status.h"
 
 namespace grpc_core {
 
@@ -45,22 +46,26 @@ class GrpcXdsTransportFactory final : public XdsTransportFactory {
  public:
   class GrpcXdsTransport;
 
-  explicit GrpcXdsTransportFactory(const ChannelArgs& args);
+  GrpcXdsTransportFactory(const ChannelArgs& args,
+                          RefCountedPtr<CertificateProviderStoreInterface>
+                              certificate_provider_store);
   ~GrpcXdsTransportFactory() override;
 
   void Orphaned() override {}
 
   RefCountedPtr<XdsTransport> GetTransport(
-      const XdsBootstrap::XdsServer& server, absl::Status* status) override;
+      const XdsBootstrap::XdsServerTarget& server,
+      absl::Status* status) override;
 
   grpc_pollset_set* interested_parties() const { return interested_parties_; }
 
  private:
   ChannelArgs args_;
+  RefCountedPtr<CertificateProviderStoreInterface> certificate_provider_store_;
   grpc_pollset_set* interested_parties_;
 
   Mutex mu_;
-  absl::flat_hash_map<std::string /*XdsServer key*/, GrpcXdsTransport*>
+  absl::flat_hash_map<std::string /*XdsServerTarget key*/, GrpcXdsTransport*>
       transports_ ABSL_GUARDED_BY(&mu_);
 };
 
@@ -70,7 +75,8 @@ class GrpcXdsTransportFactory::GrpcXdsTransport final
   class GrpcStreamingCall;
 
   GrpcXdsTransport(WeakRefCountedPtr<GrpcXdsTransportFactory> factory,
-                   const XdsBootstrap::XdsServer& server, absl::Status* status);
+                   const XdsBootstrap::XdsServerTarget& server,
+                   absl::Status* status);
   ~GrpcXdsTransport() override;
 
   void Orphaned() override;

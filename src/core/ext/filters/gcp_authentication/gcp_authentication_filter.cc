@@ -20,32 +20,37 @@
 #include <string>
 #include <utility>
 
-#include "absl/log/check.h"
-#include "absl/strings/str_cat.h"
+#include "src/core/call/security_context.h"
 #include "src/core/config/core_configuration.h"
-#include "src/core/ext/filters/gcp_authentication/gcp_authentication_service_config_parser.h"
+#include "src/core/credentials/call/gcp_service_account_identity/gcp_service_account_identity_credentials.h"
 #include "src/core/lib/channel/channel_stack.h"
 #include "src/core/lib/promise/context.h"
 #include "src/core/lib/resource_quota/arena.h"
-#include "src/core/lib/security/context/security_context.h"
-#include "src/core/lib/security/credentials/gcp_service_account_identity/gcp_service_account_identity_credentials.h"
 #include "src/core/lib/transport/transport.h"
 #include "src/core/resolver/xds/xds_resolver_attributes.h"
-#include "src/core/service_config/service_config.h"
 #include "src/core/service_config/service_config_call_data.h"
+#include "src/core/util/grpc_check.h"
+#include "absl/strings/str_cat.h"
 
 namespace grpc_core {
 
 //
-// GcpAuthenticationFilter::Call
+// GcpAuthenticationFilter::Config
 //
 
-const NoInterceptor GcpAuthenticationFilter::Call::OnClientToServerMessage;
-const NoInterceptor GcpAuthenticationFilter::Call::OnClientToServerHalfClose;
-const NoInterceptor GcpAuthenticationFilter::Call::OnServerInitialMetadata;
-const NoInterceptor GcpAuthenticationFilter::Call::OnServerToClientMessage;
-const NoInterceptor GcpAuthenticationFilter::Call::OnServerTrailingMetadata;
-const NoInterceptor GcpAuthenticationFilter::Call::OnFinalize;
+bool GcpAuthenticationFilter::Config::Equals(const FilterConfig& other) const {
+  const auto& o = DownCast<const Config&>(other);
+  return instance_name == o.instance_name && cache_size == o.cache_size;
+}
+
+std::string GcpAuthenticationFilter::Config::ToString() const {
+  return absl::StrCat("{instance_name=\"", instance_name,
+                      "\", cache_size=", cache_size, "}");
+}
+
+//
+// GcpAuthenticationFilter::Call
+//
 
 absl::Status GcpAuthenticationFilter::Call::OnClientInitialMetadata(
     ClientMetadata& /*md*/, GcpAuthenticationFilter* filter) {
@@ -90,7 +95,7 @@ absl::Status GcpAuthenticationFilter::Call::OnClientInitialMetadata(
   }
   auto& metadata_map = it->second->cluster->metadata;
   const XdsMetadataValue* metadata_value =
-      metadata_map.Find(filter->filter_config_->filter_instance_name);
+      metadata_map.Find(filter->filter_config_->instance_name);
   // If no audience in the cluster, then no need to add call creds.
   if (metadata_value == nullptr) return absl::OkStatus();
   // If the entry is present but the wrong type, fail the RPC.
@@ -144,7 +149,7 @@ GcpAuthenticationFilter::CallCredentialsCache::Get(
 // GcpAuthenticationFilter
 //
 
-const grpc_channel_filter GcpAuthenticationFilter::kFilter =
+const grpc_channel_filter GcpAuthenticationFilter::kFilterVtable =
     MakePromiseBasedFilter<GcpAuthenticationFilter, FilterEndpoint::kClient,
                            0>();
 
@@ -152,54 +157,40 @@ absl::StatusOr<std::unique_ptr<GcpAuthenticationFilter>>
 GcpAuthenticationFilter::Create(const ChannelArgs& args,
                                 ChannelFilter::Args filter_args) {
   // Get filter config.
-  auto service_config = args.GetObjectRef<ServiceConfig>();
-  if (service_config == nullptr) {
-    return absl::InvalidArgumentError(
-        "gcp_auth: no service config in channel args");
+  if (filter_args.config() == nullptr) {
+    return absl::InternalError("gcp_auth: filter config not set");
   }
-  auto* config = static_cast<const GcpAuthenticationParsedConfig*>(
-      service_config->GetGlobalParsedConfig(
-          GcpAuthenticationServiceConfigParser::ParserIndex()));
-  if (config == nullptr) {
-    return absl::InvalidArgumentError("gcp_auth: parsed config not found");
+  if (filter_args.config()->type() != Config::Type()) {
+    return absl::InternalError(
+        absl::StrCat("wrong config type passed to GCP authn filter: ",
+                     filter_args.config()->type().name()));
   }
-  auto* filter_config = config->GetConfig(filter_args.instance_id());
-  if (filter_config == nullptr) {
-    return absl::InvalidArgumentError(
-        "gcp_auth: filter instance ID not found in filter config");
-  }
+  auto config = filter_args.config().TakeAsSubclass<const Config>();
   // Get XdsConfig so that we can look up CDS resources.
   auto xds_config = args.GetObjectRef<XdsConfig>();
   if (xds_config == nullptr) {
-    return absl::InvalidArgumentError(
+    return absl::InternalError(
         "gcp_auth: xds config not found in channel args");
   }
-  // Get existing cache or create new one.
-  auto cache = filter_args.GetOrCreateState<CallCredentialsCache>(
-      filter_config->filter_instance_name, [&]() {
-        return MakeRefCounted<CallCredentialsCache>(filter_config->cache_size);
-      });
-  // Make sure size is updated, in case we're reusing a pre-existing
-  // cache but it has the wrong size.
-  cache->SetMaxSize(filter_config->cache_size);
+  // Get cache from blackboard.  This must have been populated
+  // previously by the XdsConfigSelector.
+  auto cache =
+      filter_args.GetState<CallCredentialsCache>(config->instance_name);
+  if (cache == nullptr) {
+    return absl::InternalError(
+        "gcp_auth: cache object not found in filter state");
+  }
   // Instantiate filter.
-  return std::unique_ptr<GcpAuthenticationFilter>(
-      new GcpAuthenticationFilter(std::move(service_config), filter_config,
-                                  std::move(xds_config), std::move(cache)));
+  return std::unique_ptr<GcpAuthenticationFilter>(new GcpAuthenticationFilter(
+      std::move(config), std::move(xds_config), std::move(cache)));
 }
 
 GcpAuthenticationFilter::GcpAuthenticationFilter(
-    RefCountedPtr<ServiceConfig> service_config,
-    const GcpAuthenticationParsedConfig::Config* filter_config,
+    RefCountedPtr<const Config> filter_config,
     RefCountedPtr<const XdsConfig> xds_config,
     RefCountedPtr<CallCredentialsCache> cache)
-    : service_config_(std::move(service_config)),
-      filter_config_(filter_config),
+    : filter_config_(std::move(filter_config)),
       xds_config_(std::move(xds_config)),
       cache_(std::move(cache)) {}
-
-void GcpAuthenticationFilterRegister(CoreConfiguration::Builder* builder) {
-  GcpAuthenticationServiceConfigParser::Register(builder);
-}
 
 }  // namespace grpc_core

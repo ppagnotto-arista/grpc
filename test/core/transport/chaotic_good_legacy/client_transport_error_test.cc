@@ -22,18 +22,13 @@
 
 #include <algorithm>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
-#include "absl/functional/any_invocable.h"
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
-#include "absl/strings/str_format.h"
-#include "absl/types/optional.h"
-#include "gmock/gmock.h"
-#include "gtest/gtest.h"
+#include "src/core/call/metadata_batch.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/chaotic_good_legacy/client_transport.h"
 #include "src/core/lib/event_engine/event_engine_context.h"
@@ -50,12 +45,18 @@
 #include "src/core/lib/resource_quota/resource_quota.h"
 #include "src/core/lib/slice/slice_buffer.h"
 #include "src/core/lib/slice/slice_internal.h"
-#include "src/core/lib/transport/metadata_batch.h"
 #include "src/core/lib/transport/promise_endpoint.h"
 #include "src/core/lib/transport/transport.h"
 #include "src/core/util/ref_counted_ptr.h"
 #include "test/core/event_engine/fuzzing_event_engine/fuzzing_event_engine.h"
 #include "test/core/event_engine/fuzzing_event_engine/fuzzing_event_engine.pb.h"
+#include "test/core/transport/util/mock_promise_endpoint.h"
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/functional/any_invocable.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_format.h"
 
 using testing::AtMost;
 using testing::MockFunction;
@@ -63,41 +64,16 @@ using testing::Return;
 using testing::StrictMock;
 using testing::WithArgs;
 
+using grpc_core::util::testing::MockPromiseEndpoint;
+
 namespace grpc_core {
 namespace chaotic_good_legacy {
 namespace testing {
 
-class MockEndpoint
-    : public grpc_event_engine::experimental::EventEngine::Endpoint {
+class MockClientConnectionFactory : public ClientConnectionFactory {
  public:
-  MOCK_METHOD(
-      bool, Read,
-      (absl::AnyInvocable<void(absl::Status)> on_read,
-       grpc_event_engine::experimental::SliceBuffer* buffer,
-       const grpc_event_engine::experimental::EventEngine::Endpoint::ReadArgs*
-           args),
-      (override));
-
-  MOCK_METHOD(
-      bool, Write,
-      (absl::AnyInvocable<void(absl::Status)> on_writable,
-       grpc_event_engine::experimental::SliceBuffer* data,
-       const grpc_event_engine::experimental::EventEngine::Endpoint::WriteArgs*
-           args),
-      (override));
-
-  MOCK_METHOD(
-      const grpc_event_engine::experimental::EventEngine::ResolvedAddress&,
-      GetPeerAddress, (), (const, override));
-  MOCK_METHOD(
-      const grpc_event_engine::experimental::EventEngine::ResolvedAddress&,
-      GetLocalAddress, (), (const, override));
-};
-
-struct MockPromiseEndpoint {
-  StrictMock<MockEndpoint>* endpoint = new StrictMock<MockEndpoint>();
-  PromiseEndpoint promise_endpoint{
-      std::unique_ptr<StrictMock<MockEndpoint>>(endpoint), SliceBuffer()};
+  MOCK_METHOD(PendingConnection, Connect, (absl::string_view), (override));
+  void Orphaned() final {}
 };
 
 // Send messages from client to server.
@@ -139,6 +115,17 @@ class ClientTransportTest : public ::testing::Test {
         .PreconditionChannelArgs(nullptr);
   }
 
+  template <typename... PromiseEndpoints>
+  Config MakeConfig(PromiseEndpoints... promise_endpoints) {
+    Config config(MakeChannelArgs());
+    auto name_endpoint = [i = 0]() mutable { return absl::StrCat(++i); };
+    std::vector<int> this_is_only_here_to_unpack_the_following_statement{
+        (config.ServerAddPendingDataEndpoint(ImmediateConnection(
+             name_endpoint(), std::move(promise_endpoints))),
+         0)...};
+    return config;
+  }
+
   auto MakeCall(ClientMetadataHandle client_initial_metadata) {
     auto arena = call_arena_allocator_->MakeArena();
     arena->SetContext<grpc_event_engine::experimental::EventEngine>(
@@ -166,8 +153,10 @@ class ClientTransportTest : public ::testing::Test {
 };
 
 TEST_F(ClientTransportTest, AddOneStreamWithWriteFailed) {
-  MockPromiseEndpoint control_endpoint;
-  MockPromiseEndpoint data_endpoint;
+  MockPromiseEndpoint control_endpoint(1234);
+  MockPromiseEndpoint data_endpoint(5678);
+  auto client_connection_factory =
+      MakeRefCounted<StrictMock<MockClientConnectionFactory>>();
   // Mock write failed and read is pending.
   EXPECT_CALL(*control_endpoint.endpoint, Write)
       .Times(AtMost(1))
@@ -185,9 +174,9 @@ TEST_F(ClientTransportTest, AddOneStreamWithWriteFailed) {
           }));
   EXPECT_CALL(*control_endpoint.endpoint, Read).WillOnce(Return(false));
   auto transport = MakeOrphanable<ChaoticGoodClientTransport>(
-      std::move(control_endpoint.promise_endpoint),
-      std::move(data_endpoint.promise_endpoint), MakeChannelArgs(),
-      event_engine(), HPackParser(), HPackCompressor());
+      MakeChannelArgs(), std::move(control_endpoint.promise_endpoint),
+      MakeConfig(std::move(data_endpoint.promise_endpoint)),
+      client_connection_factory);
   auto call = MakeCall(TestInitialMetadata());
   transport->StartCall(call.handler.StartCall());
   call.initiator.SpawnGuarded("test-send",
@@ -200,7 +189,7 @@ TEST_F(ClientTransportTest, AddOneStreamWithWriteFailed) {
       "test-read", [&on_done, initiator = call.initiator]() mutable {
         return Seq(
             initiator.PullServerInitialMetadata(),
-            [](ValueOrFailure<absl::optional<ServerMetadataHandle>> md) {
+            [](ValueOrFailure<std::optional<ServerMetadataHandle>> md) {
               EXPECT_TRUE(md.ok());
             },
             initiator.PullServerTrailingMetadata(),
@@ -212,12 +201,16 @@ TEST_F(ClientTransportTest, AddOneStreamWithWriteFailed) {
       });
   // Wait until ClientTransport's internal activities to finish.
   event_engine()->TickUntilIdle();
+  transport.reset();
+  event_engine()->TickUntilIdle();
   event_engine()->UnsetGlobalHooks();
 }
 
 TEST_F(ClientTransportTest, AddOneStreamWithReadFailed) {
-  MockPromiseEndpoint control_endpoint;
-  MockPromiseEndpoint data_endpoint;
+  MockPromiseEndpoint control_endpoint(1234);
+  MockPromiseEndpoint data_endpoint(5678);
+  auto client_connection_factory =
+      MakeRefCounted<StrictMock<MockClientConnectionFactory>>();
   // Mock read failed.
   EXPECT_CALL(*control_endpoint.endpoint, Read)
       .WillOnce(WithArgs<0>(
@@ -227,9 +220,9 @@ TEST_F(ClientTransportTest, AddOneStreamWithReadFailed) {
             return false;
           }));
   auto transport = MakeOrphanable<ChaoticGoodClientTransport>(
-      std::move(control_endpoint.promise_endpoint),
-      std::move(data_endpoint.promise_endpoint), MakeChannelArgs(),
-      event_engine(), HPackParser(), HPackCompressor());
+      MakeChannelArgs(), std::move(control_endpoint.promise_endpoint),
+      MakeConfig(std::move(data_endpoint.promise_endpoint)),
+      client_connection_factory);
   auto call = MakeCall(TestInitialMetadata());
   transport->StartCall(call.handler.StartCall());
   call.initiator.SpawnGuarded("test-send",
@@ -242,7 +235,7 @@ TEST_F(ClientTransportTest, AddOneStreamWithReadFailed) {
       "test-read", [&on_done, initiator = call.initiator]() mutable {
         return Seq(
             initiator.PullServerInitialMetadata(),
-            [](ValueOrFailure<absl::optional<ServerMetadataHandle>> md) {
+            [](ValueOrFailure<std::optional<ServerMetadataHandle>> md) {
               EXPECT_TRUE(md.ok());
             },
             initiator.PullServerTrailingMetadata(),
@@ -254,13 +247,17 @@ TEST_F(ClientTransportTest, AddOneStreamWithReadFailed) {
       });
   // Wait until ClientTransport's internal activities to finish.
   event_engine()->TickUntilIdle();
+  transport.reset();
+  event_engine()->TickUntilIdle();
   event_engine()->UnsetGlobalHooks();
 }
 
 TEST_F(ClientTransportTest, AddMultipleStreamWithWriteFailed) {
   // Mock write failed at first stream and second stream's write will fail too.
-  MockPromiseEndpoint control_endpoint;
-  MockPromiseEndpoint data_endpoint;
+  MockPromiseEndpoint control_endpoint(1234);
+  MockPromiseEndpoint data_endpoint(5678);
+  auto client_connection_factory =
+      MakeRefCounted<StrictMock<MockClientConnectionFactory>>();
   EXPECT_CALL(*control_endpoint.endpoint, Write)
       .Times(AtMost(1))
       .WillRepeatedly(
@@ -277,9 +274,9 @@ TEST_F(ClientTransportTest, AddMultipleStreamWithWriteFailed) {
           }));
   EXPECT_CALL(*control_endpoint.endpoint, Read).WillOnce(Return(false));
   auto transport = MakeOrphanable<ChaoticGoodClientTransport>(
-      std::move(control_endpoint.promise_endpoint),
-      std::move(data_endpoint.promise_endpoint), MakeChannelArgs(),
-      event_engine(), HPackParser(), HPackCompressor());
+      MakeChannelArgs(), std::move(control_endpoint.promise_endpoint),
+      MakeConfig(std::move(data_endpoint.promise_endpoint)),
+      client_connection_factory);
   auto call1 = MakeCall(TestInitialMetadata());
   transport->StartCall(call1.handler.StartCall());
   auto call2 = MakeCall(TestInitialMetadata());
@@ -300,7 +297,7 @@ TEST_F(ClientTransportTest, AddMultipleStreamWithWriteFailed) {
       "test-read-1", [&on_done1, initiator = call1.initiator]() mutable {
         return Seq(
             initiator.PullServerInitialMetadata(),
-            [](ValueOrFailure<absl::optional<ServerMetadataHandle>> md) {
+            [](ValueOrFailure<std::optional<ServerMetadataHandle>> md) {
               EXPECT_TRUE(md.ok());
             },
             initiator.PullServerTrailingMetadata(),
@@ -314,7 +311,7 @@ TEST_F(ClientTransportTest, AddMultipleStreamWithWriteFailed) {
       "test-read-2", [&on_done2, initiator = call2.initiator]() mutable {
         return Seq(
             initiator.PullServerInitialMetadata(),
-            [](ValueOrFailure<absl::optional<ServerMetadataHandle>> md) {
+            [](ValueOrFailure<std::optional<ServerMetadataHandle>> md) {
               EXPECT_TRUE(md.ok());
             },
             initiator.PullServerTrailingMetadata(),
@@ -326,12 +323,16 @@ TEST_F(ClientTransportTest, AddMultipleStreamWithWriteFailed) {
       });
   // Wait until ClientTransport's internal activities to finish.
   event_engine()->TickUntilIdle();
+  transport.reset();
+  event_engine()->TickUntilIdle();
   event_engine()->UnsetGlobalHooks();
 }
 
 TEST_F(ClientTransportTest, AddMultipleStreamWithReadFailed) {
-  MockPromiseEndpoint control_endpoint;
-  MockPromiseEndpoint data_endpoint;
+  MockPromiseEndpoint control_endpoint(1234);
+  MockPromiseEndpoint data_endpoint(5678);
+  auto client_connection_factory =
+      MakeRefCounted<StrictMock<MockClientConnectionFactory>>();
   // Mock read failed at first stream, and second stream's write will fail too.
   EXPECT_CALL(*control_endpoint.endpoint, Read)
       .WillOnce(WithArgs<0>(
@@ -341,9 +342,9 @@ TEST_F(ClientTransportTest, AddMultipleStreamWithReadFailed) {
             return false;
           }));
   auto transport = MakeOrphanable<ChaoticGoodClientTransport>(
-      std::move(control_endpoint.promise_endpoint),
-      std::move(data_endpoint.promise_endpoint), MakeChannelArgs(),
-      event_engine(), HPackParser(), HPackCompressor());
+      MakeChannelArgs(), std::move(control_endpoint.promise_endpoint),
+      MakeConfig(std::move(data_endpoint.promise_endpoint)),
+      client_connection_factory);
   auto call1 = MakeCall(TestInitialMetadata());
   transport->StartCall(call1.handler.StartCall());
   auto call2 = MakeCall(TestInitialMetadata());
@@ -364,7 +365,7 @@ TEST_F(ClientTransportTest, AddMultipleStreamWithReadFailed) {
       "test-read", [&on_done1, initiator = call1.initiator]() mutable {
         return Seq(
             initiator.PullServerInitialMetadata(),
-            [](ValueOrFailure<absl::optional<ServerMetadataHandle>> md) {
+            [](ValueOrFailure<std::optional<ServerMetadataHandle>> md) {
               EXPECT_TRUE(md.ok());
             },
             initiator.PullServerTrailingMetadata(),
@@ -378,7 +379,7 @@ TEST_F(ClientTransportTest, AddMultipleStreamWithReadFailed) {
       "test-read", [&on_done2, initiator = call2.initiator]() mutable {
         return Seq(
             initiator.PullServerInitialMetadata(),
-            [](ValueOrFailure<absl::optional<ServerMetadataHandle>> md) {
+            [](ValueOrFailure<std::optional<ServerMetadataHandle>> md) {
               EXPECT_TRUE(md.ok());
             },
             initiator.PullServerTrailingMetadata(),
@@ -389,6 +390,8 @@ TEST_F(ClientTransportTest, AddMultipleStreamWithReadFailed) {
             });
       });
   // Wait until ClientTransport's internal activities to finish.
+  event_engine()->TickUntilIdle();
+  transport.reset();
   event_engine()->TickUntilIdle();
   event_engine()->UnsetGlobalHooks();
 }

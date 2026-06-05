@@ -25,29 +25,29 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
+#include <variant>
 
-#include "absl/log/check.h"
-#include "absl/status/statusor.h"
-#include "absl/strings/escaping.h"
-#include "absl/strings/str_split.h"
-#include "absl/strings/string_view.h"
-#include "absl/strings/strip.h"
-#include "absl/types/optional.h"
-#include "absl/types/variant.h"
 #include "opentelemetry/sdk/resource/semantic_conventions.h"
 #include "src/core/lib/iomgr/error.h"
 #include "src/core/lib/slice/slice_internal.h"
 #include "src/core/telemetry/call_tracer.h"
 #include "src/core/util/env.h"
+#include "src/core/util/grpc_check.h"
 #include "src/cpp/ext/otel/key_value_iterable.h"
 #include "upb/base/string_view.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "absl/strings/strip.h"
 
 namespace grpc {
 namespace internal {
 
 using OptionalLabelKey =
-    grpc_core::ClientCallTracer::CallAttemptTracer::OptionalLabelKey;
+    grpc_core::ClientCallTracerInterface::CallAttemptTracer::OptionalLabelKey;
 
 namespace {
 
@@ -137,7 +137,7 @@ absl::string_view GetStringValueFromAttributeMap(
   if (it == attributes.end()) {
     return "unknown";
   }
-  const auto* string_value = absl::get_if<std::string>(&it->second);
+  const auto* string_value = std::get_if<std::string>(&it->second);
   if (string_value == nullptr) {
     return "unknown";
   }
@@ -201,19 +201,18 @@ absl::Span<const RemoteAttribute> GetAttributesForType(
   }
 }
 
-absl::optional<std::pair<absl::string_view, absl::string_view>>
+std::optional<std::pair<absl::string_view, absl::string_view>>
 NextFromAttributeList(absl::Span<const RemoteAttribute> attributes,
                       size_t start_index, size_t curr,
                       google_protobuf_Struct* decoded_metadata,
                       upb_Arena* arena) {
-  DCHECK_GE(curr, start_index);
+  GRPC_DCHECK_GE(curr, start_index);
   const size_t index = curr - start_index;
-  if (index >= attributes.size()) return absl::nullopt;
+  if (index >= attributes.size()) return std::nullopt;
   const auto& attribute = attributes[index];
-  return std::make_pair(
-      attribute.otel_attribute,
-      GetStringValueFromUpbStruct(decoded_metadata,
-                                  attribute.metadata_attribute, arena));
+  return std::pair(attribute.otel_attribute,
+                   GetStringValueFromUpbStruct(
+                       decoded_metadata, attribute.metadata_attribute, arena));
 }
 
 }  // namespace
@@ -230,7 +229,7 @@ MeshLabelsIterable::MeshLabelsIterable(
       remote_type_(StringToGcpResourceType(GetStringValueFromUpbStruct(
           struct_pb_, kMetadataExchangeTypeKey, arena_.ptr()))) {}
 
-absl::optional<std::pair<absl::string_view, absl::string_view>>
+std::optional<std::pair<absl::string_view, absl::string_view>>
 MeshLabelsIterable::Next() {
   size_t local_labels_size = local_labels_.size();
   if (pos_ < local_labels_size) {
@@ -358,15 +357,17 @@ bool ServiceMeshLabelsInjector::AddOptionalLabels(
   // Performs JSON label name format to CSM Observability Metric spec format
   // conversion.
   absl::string_view service_name =
-      optional_labels[static_cast<size_t>(
-                          grpc_core::ClientCallTracer::CallAttemptTracer::
-                              OptionalLabelKey::kXdsServiceName)]
-          .as_string_view();
+      optional_labels
+          [static_cast<size_t>(
+               grpc_core::ClientCallTracerInterface::CallAttemptTracer::
+                   OptionalLabelKey::kXdsServiceName)]
+              .as_string_view();
   absl::string_view service_namespace =
-      optional_labels[static_cast<size_t>(
-                          grpc_core::ClientCallTracer::CallAttemptTracer::
-                              OptionalLabelKey::kXdsServiceNamespace)]
-          .as_string_view();
+      optional_labels
+          [static_cast<size_t>(
+               grpc_core::ClientCallTracerInterface::CallAttemptTracer::
+                   OptionalLabelKey::kXdsServiceNamespace)]
+              .as_string_view();
   return callback("csm.service_name",
                   service_name.empty()
                       ? "unknown"

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "absl/random/random.h"
 #include "test/core/transport/test_suite/transport_test.h"
+#include "absl/random/random.h"
 
 namespace grpc_core {
 
@@ -46,7 +46,7 @@ TRANSPORT_TEST(ManyUnaryRequests) {
           return initiator.PullServerInitialMetadata();
         },
         [initiator](
-            ValueOrFailure<absl::optional<ServerMetadataHandle>> md) mutable {
+            ValueOrFailure<std::optional<ServerMetadataHandle>> md) mutable {
           EXPECT_TRUE(md.ok());
           EXPECT_TRUE(md.value().has_value());
           EXPECT_EQ(*md.value().value()->get_pointer(ContentTypeMetadata()),

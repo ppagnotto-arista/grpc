@@ -23,16 +23,11 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "absl/log/log.h"
-#include "absl/status/status.h"
-#include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
-#include "absl/types/span.h"
-#include "gtest/gtest.h"
 #include "src/core/load_balancing/backend_metric_data.h"
 #include "src/core/load_balancing/lb_policy.h"
 #include "src/core/resolver/endpoint_addresses.h"
@@ -42,6 +37,11 @@
 #include "src/core/util/time.h"
 #include "test/core/load_balancing/lb_policy_test_lib.h"
 #include "test/core/test_util/test_config.h"
+#include "gtest/gtest.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 
 namespace grpc_core {
 namespace testing {
@@ -138,8 +138,8 @@ class OutlierDetectionTest : public LoadBalancingPolicyTest {
     }
 
     Json::Object json_;
-    absl::optional<Json::Object> success_rate_;
-    absl::optional<Json::Object> failure_percentage_;
+    std::optional<Json::Object> success_rate_;
+    std::optional<Json::Object> failure_percentage_;
   };
 
   OutlierDetectionTest()
@@ -150,13 +150,12 @@ class OutlierDetectionTest : public LoadBalancingPolicyTest {
     SetExpectedTimerDuration(std::chrono::seconds(10));
   }
 
-  absl::optional<std::string> DoPickWithFailedCall(
+  std::optional<std::string> DoPickWithFailedCall(
       LoadBalancingPolicy::SubchannelPicker* picker) {
     std::unique_ptr<LoadBalancingPolicy::SubchannelCallTrackerInterface>
         subchannel_call_tracker;
-    auto address = ExpectPickComplete(picker, {}, &subchannel_call_tracker);
+    auto address = ExpectPickComplete(picker, {}, {}, &subchannel_call_tracker);
     if (address.has_value()) {
-      subchannel_call_tracker->Start();
       FakeMetadata metadata({});
       FakeBackendMetricAccessor backend_metric_accessor({});
       LoadBalancingPolicy::SubchannelCallTrackerInterface::FinishArgs args = {
@@ -238,7 +237,7 @@ TEST_F(OutlierDetectionTest, MultipleAddressesPerEndpoint) {
   // Can't use timer duration expectation here, because the Happy
   // Eyeballs timer inside pick_first will use a different duration than
   // the timer in outlier_detection.
-  SetExpectedTimerDuration(absl::nullopt);
+  SetExpectedTimerDuration(std::nullopt);
   constexpr std::array<absl::string_view, 2> kEndpoint1Addresses = {
       "ipv4:127.0.0.1:443", "ipv4:127.0.0.1:444"};
   constexpr std::array<absl::string_view, 2> kEndpoint2Addresses = {
@@ -336,7 +335,7 @@ TEST_F(OutlierDetectionTest, EjectionStateResetsWhenEndpointAddressesChange) {
   // Can't use timer duration expectation here, because the Happy
   // Eyeballs timer inside pick_first will use a different duration than
   // the timer in outlier_detection.
-  SetExpectedTimerDuration(absl::nullopt);
+  SetExpectedTimerDuration(std::nullopt);
   constexpr std::array<absl::string_view, 2> kEndpoint1Addresses = {
       "ipv4:127.0.0.1:443", "ipv4:127.0.0.1:444"};
   constexpr std::array<absl::string_view, 2> kEndpoint2Addresses = {
@@ -411,7 +410,7 @@ TEST_F(OutlierDetectionTest, DoesNotWorkWithPickFirst) {
   // Can't use timer duration expectation here, because the Happy
   // Eyeballs timer inside pick_first will use a different duration than
   // the timer in outlier_detection.
-  SetExpectedTimerDuration(absl::nullopt);
+  SetExpectedTimerDuration(std::nullopt);
   constexpr std::array<absl::string_view, 3> kAddresses = {
       "ipv4:127.0.0.1:440", "ipv4:127.0.0.1:441", "ipv4:127.0.0.1:442"};
   // Send initial update.

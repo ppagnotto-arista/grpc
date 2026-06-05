@@ -22,8 +22,6 @@
 #include <cstdint>
 #include <memory>
 
-#include "absl/random/random.h"
-#include "absl/status/statusor.h"
 #include "src/core/client_channel/connector.h"
 #include "src/core/ext/transport/chaotic_good/config.h"
 #include "src/core/handshaker/handshaker.h"
@@ -43,63 +41,68 @@
 #include "src/core/util/notification.h"
 #include "src/core/util/ref_counted_ptr.h"
 #include "src/core/util/sync.h"
+#include "absl/random/random.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 
 namespace grpc_core {
 namespace chaotic_good {
-class ChaoticGoodConnector : public SubchannelConnector {
+class ChaoticGoodConnector final : public SubchannelConnector {
  public:
-  explicit ChaoticGoodConnector(
-      std::shared_ptr<grpc_event_engine::experimental::EventEngine>
-          event_engine);
-  ~ChaoticGoodConnector() override;
   void Connect(const Args& args, Result* result, grpc_closure* notify) override;
-  void Shutdown(grpc_error_handle error) override {
+  void Shutdown(grpc_error_handle) override {
     ActivityPtr connect_activity;
     MutexLock lock(&mu_);
-    if (is_shutdown_) return;
     is_shutdown_ = true;
-    if (handshake_mgr_ != nullptr) {
-      handshake_mgr_->Shutdown(error);
-    }
     connect_activity = std::move(connect_activity_);
   };
 
  private:
-  static auto DataEndpointReadSettingsFrame(
-      RefCountedPtr<ChaoticGoodConnector> self, uint32_t data_connection_index);
-  static auto DataEndpointWriteSettingsFrame(
-      RefCountedPtr<ChaoticGoodConnector> self, uint32_t data_connection_index);
-  static auto ControlEndpointReadSettingsFrame(
-      RefCountedPtr<ChaoticGoodConnector> self);
-  static auto ControlEndpointWriteSettingsFrame(
-      RefCountedPtr<ChaoticGoodConnector> self);
-  static auto WaitForDataEndpointSetup(RefCountedPtr<ChaoticGoodConnector> self,
-                                       uint32_t data_connection_index);
-  void OnHandshakeDone(absl::StatusOr<HandshakerArgs*> result);
+  class ConnectionCreator final : public ClientConnectionFactory {
+   public:
+    ConnectionCreator(
+        grpc_event_engine::experimental::EventEngine::ResolvedAddress address,
+        const ChannelArgs& args, uint32_t max_receive_message_length)
+        : address_(address),
+          args_(args),
+          max_receive_message_length_(max_receive_message_length) {}
+    PendingConnection Connect(absl::string_view id) override;
+    void Orphaned() override {};
 
-  RefCountedPtr<Arena> arena_ = SimpleArenaAllocator()->MakeArena();
+   private:
+    grpc_event_engine::experimental::EventEngine::ResolvedAddress address_;
+    ChannelArgs args_;
+    uint32_t max_receive_message_length_;
+  };
+
+  struct ResultNotifier {
+    ResultNotifier(const Args& args, Result* result, grpc_closure* notify)
+        : args(args),
+          config(args.channel_args),
+          result(result),
+          notify(notify) {}
+
+    Args args;
+    Config config;
+    Result* result;
+    grpc_closure* notify;
+
+    void Run(absl::Status status, DebugLocation location = {}) {
+      if (notify == nullptr) return;
+      grpc_closure* cl = std::exchange(notify, nullptr);
+      EnsureRunInExecCtx([&]() { ExecCtx::Run(location, cl, status); });
+    }
+  };
+
   Mutex mu_;
-  Args args_;
-  std::unique_ptr<chaotic_good::Config> config_;
-  Result* result_ ABSL_GUARDED_BY(mu_);
-  grpc_closure* notify_ ABSL_GUARDED_BY(mu_) = nullptr;
   bool is_shutdown_ ABSL_GUARDED_BY(mu_) = false;
-  absl::StatusOr<grpc_event_engine::experimental::EventEngine::ResolvedAddress>
-      resolved_addr_;
-
-  PromiseEndpoint control_endpoint_;
-  std::vector<PromiseEndpoint> data_endpoints_;
-  std::vector<std::string> connection_ids_;
   ActivityPtr connect_activity_ ABSL_GUARDED_BY(mu_);
-  const std::shared_ptr<grpc_event_engine::experimental::EventEngine>
-      event_engine_;
-  RefCountedPtr<HandshakeManager> handshake_mgr_;
-  std::vector<std::unique_ptr<InterActivityLatch<void>>> data_endpoint_ready_;
 };
+
+absl::StatusOr<grpc_channel*> CreateChaoticGoodChannel(std::string target,
+                                                       const ChannelArgs& args);
+
 }  // namespace chaotic_good
 }  // namespace grpc_core
-
-grpc_channel* grpc_chaotic_good_channel_create(const char* target,
-                                               const grpc_channel_args* args);
 
 #endif  // GRPC_SRC_CORE_EXT_TRANSPORT_CHAOTIC_GOOD_CLIENT_CHAOTIC_GOOD_CONNECTOR_H

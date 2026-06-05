@@ -16,12 +16,12 @@
 #include <grpc/event_engine/event_engine.h>
 #include <grpc/support/port_platform.h>
 
-#include "absl/functional/any_invocable.h"
-#include "absl/log/log.h"
-#include "absl/status/status.h"
 #include "src/core/lib/iomgr/closure.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
 #include "src/core/lib/transport/error_utils.h"
+#include "absl/functional/any_invocable.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
 
 namespace grpc_event_engine {
 namespace experimental {
@@ -30,7 +30,6 @@ void RunEventEngineClosure(grpc_closure* closure, grpc_error_handle error) {
   if (closure == nullptr) {
     return;
   }
-  grpc_core::ApplicationCallbackExecCtx app_ctx;
   grpc_core::ExecCtx exec_ctx;
 #ifndef NDEBUG
   closure->scheduled = false;

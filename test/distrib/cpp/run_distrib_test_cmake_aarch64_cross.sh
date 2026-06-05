@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+PS4='+ $(date "+[%H:%M:%S %Z]")\011 '
 set -ex
 
 cd "$(dirname "$0")/../../.."
@@ -30,6 +31,7 @@ mkdir -p "cmake/build"
 pushd "cmake/build"
 cmake \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_STANDARD=17 \
   -DgRPC_INSTALL=ON \
   -DgRPC_BUILD_TESTS=OFF \
   -DgRPC_SSL_PROVIDER=package \
@@ -58,6 +60,7 @@ mkdir -p "cmake/build_arm"
 pushd "cmake/build_arm"
 cmake -DCMAKE_TOOLCHAIN_FILE=/tmp/toolchain.cmake \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CXX_STANDARD=17 \
       -DCMAKE_INSTALL_PREFIX=/tmp/install \
       ../..
 make "-j${GRPC_CPP_DISTRIBTEST_BUILD_COMPILER_JOBS}" install
@@ -70,6 +73,7 @@ mkdir -p "examples/cpp/helloworld/cmake/build_arm"
 pushd "examples/cpp/helloworld/cmake/build_arm"
 cmake -DCMAKE_TOOLCHAIN_FILE=/tmp/toolchain.cmake \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_CXX_STANDARD=17 \
       -Dabsl_DIR=/tmp/stage/lib/cmake/absl \
       -DProtobuf_DIR=/tmp/stage/lib/cmake/protobuf \
       -Dutf8_range_DIR=/tmp/stage/lib/cmake/utf8_range \

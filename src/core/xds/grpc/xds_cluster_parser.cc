@@ -19,12 +19,6 @@
 #include <memory>
 #include <utility>
 
-#include "absl/log/check.h"
-#include "absl/log/log.h"
-#include "absl/status/status.h"
-#include "absl/status/statusor.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/strip.h"
 #include "envoy/config/cluster/v3/circuit_breaker.upb.h"
 #include "envoy/config/cluster/v3/cluster.upb.h"
 #include "envoy/config/cluster/v3/cluster.upbdefs.h"
@@ -48,7 +42,9 @@
 #include "src/core/config/core_configuration.h"
 #include "src/core/lib/debug/trace.h"
 #include "src/core/load_balancing/lb_policy_registry.h"
+#include "src/core/util/down_cast.h"
 #include "src/core/util/env.h"
+#include "src/core/util/grpc_check.h"
 #include "src/core/util/host_port.h"
 #include "src/core/util/time.h"
 #include "src/core/util/upb_utils.h"
@@ -62,6 +58,11 @@
 #include "src/core/xds/xds_client/xds_backend_metric_propagation.h"
 #include "upb/base/string_view.h"
 #include "upb/text/encode.h"
+#include "absl/log/log.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/strip.h"
 
 namespace grpc_core {
 
@@ -76,6 +77,15 @@ bool XdsHttpConnectEnabled() {
 
 namespace {
 
+// TODO(mlumish): Remove this after the 1.81 release.
+bool XdsSniEnabled() {
+  auto value = GetEnv("GRPC_EXPERIMENTAL_XDS_SNI");
+  if (!value.has_value()) return true;
+  bool parsed_value;
+  bool parse_succeeded = gpr_parse_bool_value(value->c_str(), &parsed_value);
+  return parse_succeeded && parsed_value;
+}
+
 constexpr absl::string_view kUpstreamTlsContextType =
     "envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext";
 
@@ -83,44 +93,60 @@ constexpr absl::string_view kHttp11ProxyType =
     "envoy.extensions.transport_sockets.http_11_proxy.v3"
     ".Http11ProxyUpstreamTransport";
 
-CommonTlsContext UpstreamTlsContextParse(
+XdsClusterResource::UpstreamTlsContext UpstreamTlsContextParse(
     const XdsResourceType::DecodeContext& context,
     const XdsExtension& extension, ValidationErrors* errors) {
+  XdsClusterResource::UpstreamTlsContext upstream_tls_context;
   const absl::string_view* serialized_upstream_tls_context =
-      absl::get_if<absl::string_view>(&extension.value);
+      std::get_if<absl::string_view>(&extension.value);
   if (serialized_upstream_tls_context == nullptr) {
     errors->AddError("can't decode UpstreamTlsContext");
     return {};
   }
-  const auto* upstream_tls_context =
+  const auto* upstream_tls_context_proto =
       envoy_extensions_transport_sockets_tls_v3_UpstreamTlsContext_parse(
           serialized_upstream_tls_context->data(),
           serialized_upstream_tls_context->size(), context.arena);
-  if (upstream_tls_context == nullptr) {
+  if (upstream_tls_context_proto == nullptr) {
     errors->AddError("can't decode UpstreamTlsContext");
     return {};
+  }
+  if (XdsSniEnabled()) {
+    upstream_tls_context.sni = UpbStringToStdString(
+        envoy_extensions_transport_sockets_tls_v3_UpstreamTlsContext_sni(
+            upstream_tls_context_proto));
+    if (upstream_tls_context.sni.length() > 255) {
+      ValidationErrors::ScopedField field(errors, ".sni");
+      errors->AddError("must be shorter than 255 characters");
+    }
+    upstream_tls_context.auto_host_sni =
+        envoy_extensions_transport_sockets_tls_v3_UpstreamTlsContext_auto_host_sni(
+            upstream_tls_context_proto);
+    upstream_tls_context.auto_sni_san_validation =
+        envoy_extensions_transport_sockets_tls_v3_UpstreamTlsContext_auto_sni_san_validation(
+            upstream_tls_context_proto);
   }
   ValidationErrors::ScopedField field3(errors, ".common_tls_context");
   const auto* common_tls_context_proto =
       envoy_extensions_transport_sockets_tls_v3_UpstreamTlsContext_common_tls_context(
-          upstream_tls_context);
-  CommonTlsContext common_tls_context;
+          upstream_tls_context_proto);
   if (common_tls_context_proto != nullptr) {
-    common_tls_context =
+    upstream_tls_context.common_tls_context =
         CommonTlsContextParse(context, common_tls_context_proto, errors);
   }
-  if (absl::holds_alternative<absl::monostate>(
-          common_tls_context.certificate_validation_context.ca_certs)) {
+  if (std::holds_alternative<std::monostate>(
+          upstream_tls_context.common_tls_context.certificate_validation_context
+              .ca_certs)) {
     errors->AddError("no CA certs configured");
   }
-  return common_tls_context;
+  return upstream_tls_context;
 }
 
-CommonTlsContext Http11ProxyUpstreamTransportParse(
+XdsClusterResource::UpstreamTlsContext Http11ProxyUpstreamTransportParse(
     const XdsResourceType::DecodeContext& context,
     const XdsExtension& extension, ValidationErrors* errors) {
   const absl::string_view* serialized =
-      absl::get_if<absl::string_view>(&extension.value);
+      std::get_if<absl::string_view>(&extension.value);
   if (serialized == nullptr) {
     errors->AddError("can't decode Http11ProxyUpstreamTransport");
     return {};
@@ -299,7 +325,7 @@ void ParseLbPolicyConfig(const XdsResourceType::DecodeContext& context,
       envoy_config_cluster_v3_Cluster_load_balancing_policy(cluster);
   if (load_balancing_policy != nullptr) {
     const auto& registry =
-        static_cast<const GrpcXdsBootstrap&>(context.client->bootstrap())
+        DownCast<const GrpcXdsBootstrap&>(context.client->bootstrap())
             .lb_policy_registry();
     ValidationErrors::ScopedField field(errors, ".load_balancing_policy");
     const size_t original_error_count = errors->size();
@@ -402,7 +428,7 @@ void ParseUpstreamConfig(
     return;
   }
   absl::string_view* serialized_http_protocol_options =
-      absl::get_if<absl::string_view>(&extension->value);
+      std::get_if<absl::string_view>(&extension->value);
   if (serialized_http_protocol_options == nullptr) {
     errors->AddError("can't decode HttpProtocolOptions");
     return;
@@ -446,31 +472,30 @@ absl::StatusOr<std::shared_ptr<const XdsClusterResource>> CdsResourceParse(
     ValidationErrors::ScopedField field(&errors, ".cluster_type");
     const auto* custom_cluster_type =
         envoy_config_cluster_v3_Cluster_cluster_type(cluster);
-    CHECK_NE(custom_cluster_type, nullptr);
+    GRPC_CHECK_NE(custom_cluster_type, nullptr);
     ValidationErrors::ScopedField field2(&errors, ".typed_config");
     const auto* typed_config =
         envoy_config_cluster_v3_Cluster_CustomClusterType_typed_config(
             custom_cluster_type);
     if (typed_config == nullptr) {
       errors.AddError("field not present");
+    } else if (absl::string_view type_url = absl::StripPrefix(
+                   UpbStringToAbsl(google_protobuf_Any_type_url(typed_config)),
+                   "type.googleapis.com/");
+               type_url ==
+               "envoy.extensions.clusters.aggregate.v3.ClusterConfig") {
+      // Retrieve aggregate clusters.
+      ValidationErrors::ScopedField field(
+          &errors,
+          ".value[envoy.extensions.clusters.aggregate.v3.ClusterConfig]");
+      absl::string_view serialized_config =
+          UpbStringToAbsl(google_protobuf_Any_value(typed_config));
+      cds_update->type =
+          AggregateClusterParse(context, serialized_config, &errors);
     } else {
-      absl::string_view type_url = absl::StripPrefix(
-          UpbStringToAbsl(google_protobuf_Any_type_url(typed_config)),
-          "type.googleapis.com/");
-      if (type_url != "envoy.extensions.clusters.aggregate.v3.ClusterConfig") {
-        ValidationErrors::ScopedField field(&errors, ".type_url");
-        errors.AddError(
-            absl::StrCat("unknown cluster_type extension: ", type_url));
-      } else {
-        // Retrieve aggregate clusters.
-        ValidationErrors::ScopedField field(
-            &errors,
-            ".value[envoy.extensions.clusters.aggregate.v3.ClusterConfig]");
-        absl::string_view serialized_config =
-            UpbStringToAbsl(google_protobuf_Any_value(typed_config));
-        cds_update->type =
-            AggregateClusterParse(context, serialized_config, &errors);
-      }
+      ValidationErrors::ScopedField field(&errors, ".type_url");
+      errors.AddError(
+          absl::StrCat("unknown cluster_type extension: ", type_url));
     }
   } else {
     ValidationErrors::ScopedField field(&errors, ".type");
@@ -490,10 +515,10 @@ absl::StatusOr<std::shared_ptr<const XdsClusterResource>> CdsResourceParse(
     if (extension.has_value()) {
       if (XdsHttpConnectEnabled() && extension->type == kHttp11ProxyType) {
         cds_update->use_http_connect = true;
-        cds_update->common_tls_context =
+        cds_update->upstream_tls_context =
             Http11ProxyUpstreamTransportParse(context, *extension, &errors);
       } else if (extension->type == kUpstreamTlsContextType) {
-        cds_update->common_tls_context =
+        cds_update->upstream_tls_context =
             UpstreamTlsContextParse(context, *extension, &errors);
       } else {
         ValidationErrors::ScopedField field(&errors, ".type_url");
@@ -509,8 +534,9 @@ absl::StatusOr<std::shared_ptr<const XdsClusterResource>> CdsResourceParse(
       ValidationErrors::ScopedField field(&errors, ".lrs_server");
       errors.AddError("ConfigSource is not self");
     }
-    cds_update->lrs_load_reporting_server = std::make_shared<GrpcXdsServer>(
-        static_cast<const GrpcXdsServer&>(context.server));
+    cds_update->lrs_load_reporting_server =
+        std::static_pointer_cast<const GrpcXdsServerTarget>(
+            context.server.target());
   }
   // Record LRS metric propagation.
   auto propagation = MakeRefCounted<BackendMetricPropagation>();
@@ -724,7 +750,7 @@ absl::StatusOr<std::shared_ptr<const XdsClusterResource>> CdsResourceParse(
 
 void MaybeLogCluster(const XdsResourceType::DecodeContext& context,
                      const envoy_config_cluster_v3_Cluster* cluster) {
-  if (GRPC_TRACE_FLAG_ENABLED_OBJ(*context.tracer) && ABSL_VLOG_IS_ON(2)) {
+  if (GRPC_TRACE_FLAG_ENABLED(xds_client) && ABSL_VLOG_IS_ON(2)) {
     const upb_MessageDef* msg_type =
         envoy_config_cluster_v3_Cluster_getmsgdef(context.symtab);
     char buf[10240];
@@ -754,13 +780,13 @@ XdsResourceType::DecodeResult XdsClusterResourceType::Decode(
       UpbStringToStdString(envoy_config_cluster_v3_Cluster_name(resource));
   auto cds_resource = CdsResourceParse(context, resource);
   if (!cds_resource.ok()) {
-    if (GRPC_TRACE_FLAG_ENABLED_OBJ(*context.tracer)) {
+    if (GRPC_TRACE_FLAG_ENABLED(xds_client)) {
       LOG(ERROR) << "[xds_client " << context.client << "] invalid Cluster "
                  << *result.name << ": " << cds_resource.status();
     }
     result.resource = cds_resource.status();
   } else {
-    if (GRPC_TRACE_FLAG_ENABLED_OBJ(*context.tracer)) {
+    if (GRPC_TRACE_FLAG_ENABLED(xds_client)) {
       LOG(INFO) << "[xds_client " << context.client << "] parsed Cluster "
                 << *result.name << ": " << (*cds_resource)->ToString();
     }

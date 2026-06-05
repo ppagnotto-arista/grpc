@@ -22,14 +22,9 @@
 #include <stddef.h>
 
 #include <algorithm>
+#include <optional>
 #include <utility>
 
-#include "absl/status/status.h"
-#include "absl/strings/match.h"
-#include "absl/strings/str_cat.h"
-#include "absl/strings/str_split.h"
-#include "absl/strings/string_view.h"
-#include "absl/types/optional.h"
 #include "src/core/lib/iomgr/error.h"
 #include "src/core/lib/slice/slice_internal.h"
 #include "src/core/lib/transport/error_utils.h"
@@ -39,6 +34,11 @@
 #include "src/core/util/load_file.h"
 #include "src/core/util/status_helper.h"
 #include "src/core/util/validation_errors.h"
+#include "absl/status/status.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
 
 namespace grpc {
 namespace internal {
@@ -53,7 +53,7 @@ absl::StatusOr<std::string> GetGcpObservabilityConfigContents() {
   std::string contents_str;
   auto path = grpc_core::GetEnv("GRPC_GCP_OBSERVABILITY_CONFIG_FILE");
   if (path.has_value() && !path.value().empty()) {
-    auto contents = grpc_core::LoadFile(*path, /*add_null_terminator=*/true);
+    auto contents = grpc_core::LoadFile(*path, /*add_null_terminator=*/false);
     if (!contents.ok()) {
       return absl::FailedPreconditionError(absl::StrCat(
           "error loading file ", *path, ": ", contents.status().ToString()));
@@ -76,7 +76,7 @@ absl::StatusOr<std::string> GetGcpObservabilityConfigContents() {
 // empty string if not found.
 std::string GetProjectIdFromGcpEnvVar() {
   // First check GCP_PROJECT
-  absl::optional<std::string> project_id = grpc_core::GetEnv("GCP_PROJECT");
+  std::optional<std::string> project_id = grpc_core::GetEnv("GCP_PROJECT");
   if (project_id.has_value() && !project_id->empty()) {
     return project_id.value();
   }

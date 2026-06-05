@@ -21,24 +21,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 
-#include "absl/strings/str_cat.h"
-#include "absl/types/optional.h"
-#include "absl/types/variant.h"
 #include "envoy/config/core/v3/extension.upb.h"
 #include "envoy/extensions/load_balancing_policies/client_side_weighted_round_robin/v3/client_side_weighted_round_robin.upb.h"
 #include "envoy/extensions/load_balancing_policies/pick_first/v3/pick_first.upb.h"
 #include "envoy/extensions/load_balancing_policies/ring_hash/v3/ring_hash.upb.h"
 #include "envoy/extensions/load_balancing_policies/wrr_locality/v3/wrr_locality.upb.h"
 #include "google/protobuf/wrappers.upb.h"
+#include "src/core/client_channel/client_channel_service_config.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/load_balancing/lb_policy_registry.h"
+#include "src/core/load_balancing/weighted_round_robin/weighted_round_robin.h"
 #include "src/core/util/time.h"
 #include "src/core/util/validation_errors.h"
 #include "src/core/xds/grpc/xds_common_types.h"
 #include "src/core/xds/grpc/xds_common_types_parser.h"
+#include "absl/strings/str_cat.h"
 
 namespace grpc_core {
 
@@ -134,6 +136,22 @@ class ClientSideWeightedRoundRobinLbPolicyConfigFactory final
         errors->AddError("value must be non-negative");
       }
       config["errorUtilizationPenalty"] = Json::FromNumber(value);
+    }
+    // metric_names_for_computing_utilization
+    if (WrrCustomMetricsEnabled()) {
+      size_t size;
+      auto metric_names_for_computing_utilization =
+          envoy_extensions_load_balancing_policies_client_side_weighted_round_robin_v3_ClientSideWeightedRoundRobin_metric_names_for_computing_utilization(
+              resource, &size);
+      if (metric_names_for_computing_utilization != nullptr && size != 0) {
+        Json::Array metric_names;
+        for (size_t i = 0; i < size; ++i) {
+          metric_names.emplace_back(Json::FromString(
+              UpbStringToStdString(metric_names_for_computing_utilization[i])));
+        }
+        config["metricNamesForComputingUtilization"] =
+            Json::FromArray(std::move(metric_names));
+      }
     }
     return Json::Object{
         {"weighted_round_robin", Json::FromObject(std::move(config))}};
@@ -337,7 +355,7 @@ Json::Array XdsLbPolicyRegistry::ConvertXdsLbPolicyConfig(
     if (!extension.has_value()) return {};
     // Check for registered LB policy type.
     absl::string_view* serialized_value =
-        absl::get_if<absl::string_view>(&extension->value);
+        std::get_if<absl::string_view>(&extension->value);
     if (serialized_value != nullptr) {
       auto config_factory_it = policy_config_factories_.find(extension->type);
       if (config_factory_it != policy_config_factories_.end()) {
@@ -347,7 +365,7 @@ Json::Array XdsLbPolicyRegistry::ConvertXdsLbPolicyConfig(
       }
     }
     // Check for custom LB policy type.
-    Json* json = absl::get_if<Json>(&extension->value);
+    Json* json = std::get_if<Json>(&extension->value);
     if (json != nullptr &&
         CoreConfiguration::Get().lb_policy_registry().LoadBalancingPolicyExists(
             extension->type, nullptr)) {
